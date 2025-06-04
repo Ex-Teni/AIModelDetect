@@ -1,4 +1,4 @@
-# multiDetect_api.py - FIXED VERSION
+# multiDetect_api.py - MODIFIED WITH EASYOCR + SEAL DETECTION
 import asyncio
 import subprocess
 import time
@@ -8,6 +8,7 @@ import json
 import base64
 import numpy as np
 import joblib
+import easyocr
 from fastapi import FastAPI, WebSocket, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,7 +25,7 @@ app = FastAPI()
 
 # ===== GLOBAL VARIABLES =====
 latest_frame = None
-latest_metadata = {"plate": "None", "container": "None", "face": "None"}
+latest_metadata = {"plate": "None", "container": "None", "face": "None", "seal": "None"}
 frame_lock = threading.Lock()
 
 # ===== CORS =====
@@ -36,15 +37,17 @@ app.add_middleware(
 )
 
 # ===== CONFIG =====
-alphabet = sorted("0123456789ABCDEFGHIJKLMNPQRSTUVWXYZ")
 device = "cuda" if torch.cuda.is_available() else "cpu"
-char_conf = 0.9
 MINDETECT = 0.95  # ngưỡng nhận diện face
+OCR_CONFIDENCE_THRESHOLD = 0.5  # ngưỡng tin cậy cho EasyOCR
+SEAL_OCR_CONFIDENCE_THRESHOLD = 0.3  # ngưỡng thấp hơn cho Seal vì có thể khó đọc
 
 # ===== LOAD MODEL =====
-char_model = YOLO("modelAI/detect_Character.pt")
 plate_model = YOLO("modelAI/detect_PlateNumber.pt")
 container_model = YOLO("modelAI/detect_ContainerCode.pt")
+
+# EasyOCR Reader - khởi tạo một lần
+easyocr_reader = easyocr.Reader(['en'], gpu=(device == 'cuda'))
 
 # MTCNN + FaceNet
 mtcnn = MTCNN(keep_all=True, device=device)
@@ -58,11 +61,6 @@ except Exception:
     print("[WARNING] Face recognition models not found")
     classifier = None
     label_encoder = None
-
-# ===== Mapping bảng ký tự =====
-char_to_index = {c: i + 1 for i, c in enumerate(alphabet)}
-index_to_char = {i: c for c, i in char_to_index.items()}
-index_to_char[0] = ""
 
 # ===== Transform face =====
 face_transform = transforms.Compose([
@@ -84,23 +82,170 @@ def encode_image_to_base64(img) -> str:
     _, buff = cv2.imencode(".jpg", img)
     return base64.b64encode(buff).decode("utf-8") # type: ignore
 
-# ===== Tách ký tự theo dòng =====
-def group_char_to_1line(boxes, y_threshold=20):
-    rows = []
-    boxes = sorted(boxes, key=lambda b: b[1])
-    for box in boxes:
-        placed = False
-        for row in rows:
-            if abs(box[1] - row[0][1]) < y_threshold:
-                row.append(box)
-                placed = True
-                break
-        if not placed:
-            rows.append([box])
-    for row in rows:
-        row.sort(key=lambda b: b[0])
-    rows.sort(key=lambda r: r[0][1])
-    return rows
+# ===== EasyOCR function to replace character detection =====
+def extract_text_with_easyocr(image_crop, confidence_threshold=OCR_CONFIDENCE_THRESHOLD):
+    """
+    Sử dụng EasyOCR để nhận diện text từ crop image
+    Trả về text và confidence score
+    """
+    try:
+        # Chuyển đổi sang RGB nếu cần
+        if len(image_crop.shape) == 3 and image_crop.shape[2] == 3:
+            image_rgb = cv2.cvtColor(image_crop, cv2.COLOR_BGR2RGB)
+        else:
+            image_rgb = image_crop
+        
+        # Sử dụng EasyOCR để đọc text
+        results = easyocr_reader.readtext(image_rgb)
+        
+        if not results:
+            return None, 0.0
+        
+        # Lấy kết quả có confidence cao nhất
+        best_result = max(results, key=lambda x: x[2]) # type: ignore
+        text = best_result[1].strip() # type: ignore
+        confidence = float(best_result[2]) # type: ignore
+        
+        # Chỉ trả về kết quả nếu confidence >= threshold
+        if confidence >= confidence_threshold:
+            return text, confidence
+        else:
+            return None, confidence
+            
+    except Exception as e:
+        print(f"[ERROR] EasyOCR extraction failed: {e}")
+        return None, 0.0
+
+# ===== NEW: Direct Seal OCR Detection =====
+def detect_seal_text(frame):
+    """
+    Detect Seal text directly from frame using EasyOCR
+    This function scans the entire frame for text that doesn't belong to plates or containers
+    """
+    results = []
+    try:
+        # Chuyển đổi sang RGB
+        if len(frame.shape) == 3 and frame.shape[2] == 3:
+            image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        else:
+            image_rgb = frame
+        
+        # Sử dụng EasyOCR để đọc tất cả text trong frame
+        ocr_results = easyocr_reader.readtext(image_rgb)
+        
+        # Lấy các bounding box từ plate và container models để loại trừ
+        plate_boxes = []
+        container_boxes = []
+        
+        # Detect plates để loại trừ
+        plate_detections = plate_model(frame)[0]
+        for box in plate_detections.boxes:
+            if float(box.conf[0]) > 0.1:  # Chỉ lấy các detection có confidence > 0.1
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                plate_boxes.append([x1, y1, x2, y2])
+        
+        # Detect containers để loại trừ
+        container_detections = container_model(frame)[0]
+        for box in container_detections.boxes:
+            if float(box.conf[0]) > 0.1:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                container_boxes.append([x1, y1, x2, y2])
+        
+        # Xử lý từng text detection từ EasyOCR
+        for detection in ocr_results:
+            bbox, text, confidence = detection
+            
+            # Chỉ xử lý nếu confidence >= threshold
+            if confidence < SEAL_OCR_CONFIDENCE_THRESHOLD: # type: ignore
+                continue
+                
+            # Chuyển đổi bbox từ EasyOCR format sang [x1, y1, x2, y2]
+            points = np.array(bbox, dtype=int)
+            x1 = int(np.min(points[:, 0]))
+            y1 = int(np.min(points[:, 1]))
+            x2 = int(np.max(points[:, 0]))
+            y2 = int(np.max(points[:, 1]))
+            
+            # Kiểm tra xem text này có nằm trong vùng plate hoặc container không
+            is_in_existing_detection = False
+            
+            # Kiểm tra overlap với plate boxes
+            for plate_box in plate_boxes:
+                if boxes_overlap([x1, y1, x2, y2], plate_box):
+                    is_in_existing_detection = True
+                    break
+            
+            # Kiểm tra overlap với container boxes
+            if not is_in_existing_detection:
+                for container_box in container_boxes:
+                    if boxes_overlap([x1, y1, x2, y2], container_box):
+                        is_in_existing_detection = True
+                        break
+            
+            # Nếu không overlap với plate/container và có text hợp lệ
+            if not is_in_existing_detection and text.strip():
+                # Filter cho Seal - có thể thêm logic filter ở đây
+                filtered_text = filter_seal_text(text.strip())
+                if filtered_text:
+                    results.append({
+                        "type": "seal",
+                        "box": [x1, y1, x2, y2],
+                        "text": filtered_text,
+                        "confidence": confidence
+                    })
+        
+        return results
+        
+    except Exception as e:
+        print(f"[ERROR] Seal text detection failed: {e}")
+        return []
+
+def boxes_overlap(box1, box2, threshold=0.3):
+    """
+    Kiểm tra xem 2 bounding box có overlap không
+    threshold: tỷ lệ overlap tối thiểu để coi là overlap
+    """
+    x1_1, y1_1, x2_1, y2_1 = box1
+    x1_2, y1_2, x2_2, y2_2 = box2
+    
+    # Tính intersection
+    x_left = max(x1_1, x1_2)
+    y_top = max(y1_1, y1_2)
+    x_right = min(x2_1, x2_2)
+    y_bottom = min(y2_1, y2_2)
+    
+    if x_right < x_left or y_bottom < y_top:
+        return False
+    
+    intersection_area = (x_right - x_left) * (y_bottom - y_top)
+    box1_area = (x2_1 - x1_1) * (y2_1 - y1_1)
+    box2_area = (x2_2 - x1_2) * (y2_2 - y1_2)
+    
+    # Tính tỷ lệ overlap
+    overlap_ratio = intersection_area / min(box1_area, box2_area)
+    return overlap_ratio > threshold
+
+def filter_seal_text(text):
+    """
+    Filter text để chỉ giữ lại những text có thể là Seal
+    Có thể customize logic này theo yêu cầu cụ thể
+    """
+    # Loại bỏ text quá ngắn
+    if len(text) < 3:
+        return None
+    
+    # Loại bỏ text chỉ chứa số (có thể là từ plate)
+    if text.isdigit():
+        return None
+    
+    # Loại bỏ text chỉ chứa ký tự đặc biệt
+    if not any(c.isalnum() for c in text):
+        return None
+    
+    # Có thể thêm thêm logic filter khác ở đây
+    # Ví dụ: filter theo pattern của Seal number
+    
+    return text.upper().strip()
 
 # ===== Streamming =====
 def update_latest_frame_and_metadata(frame, metadata):
@@ -129,15 +274,17 @@ def generate_mjpeg():
         else:
             time.sleep(0.05)
 
-# ===== Detect Plates =====
+# ===== Detect Plates - MODIFIED TO USE EASYOCR =====
 def detect_plates(frame):
     results = []
     yolo_out = plate_model(frame)[0]
+    
     for box in yolo_out.boxes:
         conf = float(box.conf[0])
         x1, y1, x2, y2 = map(int, box.xyxy[0])
-        # Nếu confidence < 0.5 thì trả Unknown
-        if conf < 0.5:
+        
+        # Nếu confidence < 0.1 thì trả Unknown
+        if conf < 0.1:
             results.append({
                 "type": "plate",
                 "box": [x1, y1, x2, y2],
@@ -146,54 +293,55 @@ def detect_plates(frame):
             })
             continue
 
-        # Crop vùng biển số và resize về size chuẩn (320×80)
+        # Crop vùng biển số
         h, w = frame.shape[:2]
-        x1_clamped = max(0, x1); y1_clamped = max(0, y1)
-        x2_clamped = min(w, x2); y2_clamped = min(h, y2)
+        x1_clamped = max(0, x1)
+        y1_clamped = max(0, y1)
+        x2_clamped = min(w, x2)
+        y2_clamped = min(h, y2)
+        
         if x2_clamped <= x1_clamped or y2_clamped <= y1_clamped:
             continue
-        cropped = cv2.resize(frame[y1_clamped:y2_clamped, x1_clamped:x2_clamped], (320, 80))
+            
+        cropped = frame[y1_clamped:y2_clamped, x1_clamped:x2_clamped]
+        
+        # Resize để cải thiện OCR (tùy chọn)
+        if cropped.shape[0] < 50 or cropped.shape[1] < 150:
+            scale_factor = max(50 / cropped.shape[0], 150 / cropped.shape[1])
+            new_height = int(cropped.shape[0] * scale_factor)
+            new_width = int(cropped.shape[1] * scale_factor)
+            cropped = cv2.resize(cropped, (new_width, new_height))
 
-        # Chạy detect ký tự trên crop
-        char_out = char_model(cropped)[0]
-        char_boxes = []
-        for cbox in char_out.boxes:
-            cconf = float(cbox.conf[0])
-            cls_id = int(cbox.cls[0])
-            pred_char = index_to_char.get(cls_id, "?") if cconf >= char_conf else "?"
-            cx1, cy1, cx2, cy2 = map(int, cbox.xyxy[0])
-            char_boxes.append([cx1, cy1, cx2, cy2, pred_char, cconf])
-
-        grouped = group_char_to_1line(char_boxes)
-        all_chars = [c for line in grouped for c in line]
-        recognized = "".join([c[4] for c in all_chars])
-        valid_chars = [c for c in all_chars if c[4] != "?"]
-        acc = len(valid_chars) / len(all_chars) if all_chars else 0.0
-
-        if acc >= 0.9:
+        # Sử dụng EasyOCR thay vì model AI
+        recognized_text, ocr_confidence = extract_text_with_easyocr(cropped)
+        
+        if recognized_text is not None:
             results.append({
                 "type": "plate",
                 "box": [x1, y1, x2, y2],
-                "text": recognized,
-                "confidence": acc
+                "text": recognized_text,
+                "confidence": ocr_confidence
             })
         else:
             results.append({
                 "type": "plate",
                 "box": [x1, y1, x2, y2],
                 "text": None,
-                "confidence": acc
+                "confidence": ocr_confidence
             })
+    
     return results
 
-# ===== Detect Container =====
+# ===== Detect Container - MODIFIED TO USE EASYOCR =====
 def detect_containers(frame):
     results = []
     yolo_out = container_model(frame)[0]
+    
     for box in yolo_out.boxes:
         conf = float(box.conf[0])
         x1, y1, x2, y2 = map(int, box.xyxy[0])
-        if conf < 0.5:
+        
+        if conf < 0.1:
             results.append({
                 "type": "container",
                 "box": [x1, y1, x2, y2],
@@ -202,46 +350,46 @@ def detect_containers(frame):
             })
             continue
 
-        # Crop → detect ký tự
+        # Crop vùng container
         h, w = frame.shape[:2]
-        x1_clamped = max(0, x1); y1_clamped = max(0, y1)
-        x2_clamped = min(w, x2); y2_clamped = min(h, y2)
+        x1_clamped = max(0, x1)
+        y1_clamped = max(0, y1)
+        x2_clamped = min(w, x2)
+        y2_clamped = min(h, y2)
+        
         if x2_clamped <= x1_clamped or y2_clamped <= y1_clamped:
             continue
-        cropped = cv2.resize(frame[y1_clamped:y2_clamped, x1_clamped:x2_clamped], (320, 80))
+            
+        cropped = frame[y1_clamped:y2_clamped, x1_clamped:x2_clamped]
+        
+        # Resize để cải thiện OCR (tùy chọn)
+        if cropped.shape[0] < 50 or cropped.shape[1] < 150:
+            scale_factor = max(50 / cropped.shape[0], 150 / cropped.shape[1])
+            new_height = int(cropped.shape[0] * scale_factor)
+            new_width = int(cropped.shape[1] * scale_factor)
+            cropped = cv2.resize(cropped, (new_width, new_height))
 
-        char_out = char_model(cropped)[0]
-        char_boxes = []
-        for cbox in char_out.boxes:
-            cconf = float(cbox.conf[0])
-            cls_id = int(cbox.cls[0])
-            pred_char = index_to_char.get(cls_id, "?") if cconf >= char_conf else "?"
-            cx1, cy1, cx2, cy2 = map(int, cbox.xyxy[0])
-            char_boxes.append([cx1, cy1, cx2, cy2, pred_char, cconf])
-
-        grouped = group_char_to_1line(char_boxes)
-        all_chars = [c for line in grouped for c in line]
-        recognized = "".join([c[4] for c in all_chars])
-        valid_chars = [c for c in all_chars if c[4] != "?"]
-        acc = len(valid_chars) / len(all_chars) if all_chars else 0.0
-
-        if acc >= 0.9:
+        # Sử dụng EasyOCR thay vì model AI
+        recognized_text, ocr_confidence = extract_text_with_easyocr(cropped)
+        
+        if recognized_text is not None:
             results.append({
                 "type": "container",
                 "box": [x1, y1, x2, y2],
-                "text": recognized,
-                "confidence": acc
+                "text": recognized_text,
+                "confidence": ocr_confidence
             })
         else:
             results.append({
                 "type": "container",
                 "box": [x1, y1, x2, y2],
                 "text": None,
-                "confidence": acc
+                "confidence": ocr_confidence
             })
+    
     return results
 
-# ===== Detect Faces =====
+# ===== Detect Faces - UNCHANGED =====
 def detect_faces(frame):
     if classifier is None or label_encoder is None:
         return []
@@ -302,9 +450,10 @@ def detect_faces(frame):
 # ===== Vẽ bounding box lên frame =====
 def draw_detections(frame, detections):
     colors = {
-        "plate": (0, 255, 0),
-        "container": (255, 0, 0),
-        "face": (0, 0, 255)
+        "plate": (0, 255, 0),      # Green
+        "container": (255, 0, 0),   # Blue
+        "face": (0, 0, 255),       # Red
+        "seal": (255, 255, 0)      # Cyan
     }
     for det in detections:
         x1, y1, x2, y2 = det["box"]
@@ -318,19 +467,20 @@ def draw_detections(frame, detections):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
     return frame
 
-# ===== Core xử lý 1 frame =====
+# ===== Core xử lý 1 frame - UPDATED =====
 def process_image(frame):
     detections = []
     detections += detect_plates(frame)
     detections += detect_containers(frame)
     detections += detect_faces(frame)
+    detections += detect_seal_text(frame)  # NEW: Add seal detection
     annotated = draw_detections(frame.copy(), detections)
     return annotated, detections
 
-# ===== Extract metadata từ detections =====
+# ===== Extract metadata từ detections - UPDATED =====
 def extract_metadata(detections: List[Dict[str, Any]]) -> Dict[str, str]:
     """Trích xuất metadata từ detections cho Flutter"""
-    metadata = {"plate": "None", "container": "None", "face": "None"}
+    metadata = {"plate": "None", "container": "None", "face": "None", "seal": "None"}
     
     for det in detections:
         det_type = det["type"]
@@ -343,25 +493,28 @@ def extract_metadata(detections: List[Dict[str, Any]]) -> Dict[str, str]:
                 metadata["container"] = text
             elif det_type == "face":
                 metadata["face"] = text
+            elif det_type == "seal":  # NEW
+                metadata["seal"] = text
     
     return metadata
 
-# ===== Endpoint: Health check =====
+# ===== Endpoint: Health check - UPDATED =====
 @app.get("/health")
 def health():
     return {
         "status": "healthy",
         "device": device,
         "models": {
-            "char_model": True,
+            "easyocr_reader": True,
             "plate_model": True,
             "container_model": True,
             "face_classifier": (classifier is not None),
-            "label_encoder": (label_encoder is not None)
+            "label_encoder": (label_encoder is not None),
+            "seal_detection": True  # NEW
         }
     }
 
-# ===== Endpoint: start-stream =====
+# ===== Rest of the endpoints remain unchanged =====
 @app.get("/start-stream")
 def start_stream():
     """
@@ -375,12 +528,10 @@ def start_stream():
     except Exception as e:
         return JSONResponse({"error": f"Cannot start client_camera: {e}"}, status_code=500)
 
-# ===== Endpoint: video-feed =====
 @app.get("/video-feed/combined-detection")
 def video_feed():
     return StreamingResponse(generate_mjpeg(), media_type="multipart/x-mixed-replace; boundary=frame")
 
-# ===== WebSocket: combined detection - FIXED =====
 @app.websocket("/ws/combined-detection")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -455,7 +606,6 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception as e:
         print(f"[WebSocket Error] Connection error: {e}")
 
-# ===== WebSocket riêng cho Flutter metadata - NEW =====
 @app.websocket("/ws/flutter-metadata")
 async def flutter_metadata_endpoint(websocket: WebSocket):
     """WebSocket riêng để gửi metadata cho Flutter app"""
