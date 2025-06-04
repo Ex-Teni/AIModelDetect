@@ -5,65 +5,138 @@ import time
 import cv2
 from fastapi.responses import StreamingResponse
 import numpy as np
-from fastapi import FastAPI, UploadFile, File, WebSocket
-from pydantic import BaseModel
-from ultralytics import YOLO
-import torch 
-from typing import List 
+from fastapi import FastAPI, WebSocket
+import torch
 import subprocess
+import easyocr
 
-import websocket
-
-
-# === Config ===
-alphabet = sorted("0123456789ABCDEFGHIJKLMNPQRSTUVWXYZ")
-device = "cuda" if torch.cuda.is_available() else "cpu"
-char_conf = 0.9 # Chỉ detect ký tự nào có xác xuất >90%
-
-# === Model AI ====
-char_model = YOLO("modelAI/detect_Character.pt") # model chữ
-container_model = YOLO("modelAI/") # model số seal
-
-# === Mapping Char ===
-char_to_index = {c: i +1 for i, c in enumerate(alphabet)}
-index_to_char = {i: c for c, i in char_to_index.items()}
-index_to_char[0] = ""
-
-# === Streaming frame setup ===
-latest_frame = None
-frame_lock = threading.Lock()
 app = FastAPI()
 
-# === Group char ===
-def group_char_to_1line(boxes, y_threshold=20): # Ghép 2 dòng lại thành 1
-    rows = []
-    boxes = sorted(boxes, key = lambda b: b[1])
-    for box in boxes:
-        placed = True
-        for row in rows:
-            if abs(box[1] - row[0][1]) < y_threshold:
-                row.append(box)
-                placed = True
-                break
-        if not placed: 
-            rows.append([box])
-    for row in rows:
-        row.sort(key = lambda b: b[0])
-    rows.sort(key = lambda r: r[0][1])
-    return rows
+# ========== Config ==========
+device = "cuda" if torch.cuda.is_available() else "cpu"
+ocr_conf_threshold = 0.3        # Ngưỡng confidence cho EasyOCR
+min_text_length = 2             # Độ dài tối thiểu của text để hiển thị
 
-def decode_base64_to_image(base64_str): # Nhận dữ liệu base64 từ client_camera decode lại thành ảnh
+# ========== EasyOCR Reader ==========
+reader = easyocr.Reader(['en'], gpu=torch.cuda.is_available())  # EasyOCR reader
+
+# ========== Shared Frame ==========
+latest_frame = None
+frame_lock = threading.Lock()
+
+
+# ========== Helper Functions ==========
+def decode_base64_to_image(base64_str):
     image_data = base64.b64decode(base64_str)
     np_arr = np.frombuffer(image_data, np.uint8)
     return cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
-def encode_image_to_base64(image): # Encode ảnh lại thành base64 gửi dữ liệu đến frontend
-    _, buffer = cv2.imencode(".jpg" ,image)
+
+def encode_image_to_base64(image):
+    _, buffer = cv2.imencode(".jpg", image)
     return base64.b64encode(buffer).decode("utf-8") # type: ignore
 
 
-#==================== Stream Video ======================
-@app.get("/video-feed/seal-number")
+def get_all_text_from_image(image, confidence_threshold=0.3):
+    """
+    Sử dụng EasyOCR để đọc tất cả text từ ảnh
+    Returns: list of (bbox, text, confidence)
+    """
+    try:
+        # Chuyển sang grayscale để OCR hoạt động tốt hơn
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = image
+            
+        # Sử dụng EasyOCR để đọc text
+        results = reader.readtext(gray)
+        
+        # Lọc kết quả theo confidence và độ dài
+        filtered_results = []
+        for result in results:
+            bbox, text, confidence = result
+            if confidence >= confidence_threshold and len(text.strip()) >= min_text_length: # type: ignore
+                # Chuyển bbox từ format của EasyOCR sang format [x1, y1, x2, y2]
+                bbox_points = np.array(bbox)
+                x1 = int(np.min(bbox_points[:, 0]))
+                y1 = int(np.min(bbox_points[:, 1]))
+                x2 = int(np.max(bbox_points[:, 0]))
+                y2 = int(np.max(bbox_points[:, 1]))
+                
+                filtered_results.append({
+                    "bbox": [x1, y1, x2, y2],
+                    "text": text.strip(),
+                    "confidence": confidence
+                })
+        
+        return filtered_results
+        
+    except Exception as e:
+        print(f"[ERROR] OCR processing failed: {e}")
+        return []
+
+
+def preprocess_image_for_ocr(image):
+    # Tiền xử lý ảnh để OCR hoạt động tốt hơn
+    # Chuyển sang grayscale
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image
+    
+    # Tăng độ tương phản
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    enhanced = clahe.apply(gray)
+    
+    # Gaussian blur nhẹ để giảm noise
+    blurred = cv2.GaussianBlur(enhanced, (1, 1), 0)
+    
+    return blurred
+
+
+def draw_text_boxes(image, text_results):
+    """
+    Vẽ bounding box và text lên ảnh
+    """
+    for result in text_results:
+        bbox = result["bbox"]
+        text = result["text"]
+        confidence = result["confidence"]
+        
+        x1, y1, x2, y2 = bbox
+        
+        # Chọn màu dựa trên confidence
+        if confidence >= 0.8:
+            color = (0, 255, 0)  # Xanh lá - confidence cao
+        elif confidence >= 0.5:
+            color = (0, 165, 255)  # Cam - confidence trung bình
+        else:
+            color = (0, 0, 255)  # Đỏ - confidence thấp
+        
+        # Vẽ bounding box
+        cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
+        
+        # Vẽ text và confidence
+        label_text = f"{text} ({confidence*100:.1f}%)"
+        
+        # Tính toán vị trí text để không bị che
+        label_size = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+        label_y = max(y1 - 10, label_size[1] + 10)
+        
+        # Vẽ background cho text
+        cv2.rectangle(image, (x1, label_y - label_size[1] - 10), 
+                     (x1 + label_size[0], label_y + 5), color, -1)
+        
+        # Vẽ text
+        cv2.putText(image, label_text, (x1, label_y - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    
+    return image
+
+
+# ========== Streaming Endpoint ==========
+@app.get("/video-feed/text-detection")
 def video_feed():
     def generate():
         while True:
@@ -73,76 +146,126 @@ def video_feed():
                     frame_bytes = jpeg.tobytes()
                     yield (b'--frame\r\n'
                            b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-            time.sleep(0.03) #30fps
-    return StreamingResponse(generate(), media_type = "multipart/x-mixed-replace; boundary=frame")
+            time.sleep(0.03)  # 30 fps
+    return StreamingResponse(generate(), media_type="multipart/x-mixed-replace; boundary=frame")
 
-# ======================== API ==========================
 
-# === WebSocket ===
-@app.websocket("/ws/seal-detection")
-async def websocket_container_code(websocket: WebSocket):
+@app.get("/start-stream")
+def start_stream():
+    subprocess.Popen(["python", "client_camera.py"])
+    return {"status": "streaming started"}
+
+
+# ========== WebSocket Endpoint ==========
+@app.websocket("/ws/text-detection")
+async def websocket_text_detection(websocket: WebSocket):
     await websocket.accept()
     global latest_frame
+    print(f"[INFO] Text OCR API connected: {websocket.client}")
 
     while True:
         try:
-            data = await websocket.receive_text() # type: ignore
-            incoming_data = json.loads(data)
+            data = await websocket.receive_text()
+            try:
+                incoming_data = json.loads(data)
+            except Exception as ex:
+                print("[DEBUG] json.loads failed:", ex)
+                continue
+
+            if "image" not in incoming_data:
+                print("[DEBUG] No 'image' key in incoming_data:", incoming_data.keys())
+                continue
 
             frame = decode_base64_to_image(incoming_data["image"])
-            detect_result = container_model(frame)[0]
-
-            container_results = []
-
-            for container_box in detect_result.boxes:
-                container_conf = float(container_box.confidence[0])
-                if container_conf < 0.9:
-                    continue  # bỏ qua nếu container box < 90%
-
-                x1, y1, x2, y2 = map(int, container_box.xyxy[0])
-                plate_crop = cv2.resize(frame[y1:y2, x1:x2], (320, 80))
-                char_result = char_model(plate_crop)[0]
-
-                character_boxes = []
-                for char_box in char_result.boxes:
-                    confidence = float(char_box.conf[0])
-                    class_id = int(char_box.cls[0])
-                    predicted_char = index_to_char.get(class_id, "?") if confidence >= char_conf else "?"
-                    
-                    cx1, cy1, cx2, cy2 = map(int, char_box.xyxy[0])
-                    character_boxes.append([cx1, cy1, cx2, cy2, predicted_char, confidence])
-
-                grouped_character_lines = group_char_to_1line,(character_boxes)
-                all_chars = [c for line in grouped_character_lines for c in line] # type: ignore
-                recognized_plate_text = ''.join(c[4] for c in all_chars)
-
-                valid_chars = [c for c in all_chars if c[4] != "?"]
-                accuracy = len(valid_chars) / len(all_chars) if all_chars else 0.0
-
-
-                # Vẽ bounding box và text
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(frame, recognized_plate_text, (x1, max(y1 - 10, 0)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 0), 2)
-
-                container_results.append({
-                    "box": [x1, y1, x2, y2],
-                    "code": recognized_plate_text
+            original_frame = frame.copy()
+            
+            # Tiền xử lý ảnh để OCR tốt hơn
+            processed_frame = preprocess_image_for_ocr(frame)
+            
+            # Sử dụng EasyOCR để đọc tất cả text trong ảnh
+            text_results = get_all_text_from_image(processed_frame, ocr_conf_threshold)
+            
+            # Vẽ bounding box và text lên frame gốc
+            annotated_frame = draw_text_boxes(original_frame, text_results)
+            
+            # Tạo response data
+            detection_results = []
+            for result in text_results:
+                detection_results.append({
+                    "box": result["bbox"],
+                    "text": result["text"],
+                    "confidence": result["confidence"]
                 })
+            
+            # Thêm thông tin tổng quan
+            total_texts = len(detection_results)
+            high_conf_texts = len([r for r in detection_results if r["confidence"] >= 0.8])
+            
+            # Vẽ thông tin tổng quan lên góc trái trên
+            info_text = f"Total: {total_texts} | High Conf: {high_conf_texts}"
+            cv2.rectangle(annotated_frame, (10, 10), (400, 50), (0, 0, 0), -1)
+            cv2.putText(annotated_frame, info_text, (15, 35),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-            # Cập nhật frame mới nhất để stream
+            # Cập nhật frame
             with frame_lock:
-                global latest_frame
-                latest_frame = frame.copy()
-                print("Updated latest frame")
+                latest_frame = annotated_frame.copy()
 
-            encoded_frame = encode_image_to_base64(frame)
-
+            # Gửi kết quả qua WebSocket
+            encoded_frame = encode_image_to_base64(annotated_frame)
             await websocket.send_text(json.dumps({
-                "seals": container_results,
+                "texts": detection_results,
+                "total_count": total_texts,
+                "high_confidence_count": high_conf_texts,
                 "image_base64": encoded_frame
-            }))
+            }, ensure_ascii=False))
 
         except Exception as e:
             print("[ERROR] WebSocket Error:", e)
             break
+
+
+# ========== Additional Endpoints ==========
+@app.get("/")
+def read_root():
+    return {
+        "message": "Text OCR Detection API",
+        "endpoints": {
+            "websocket": "/ws/text-detection",
+            "video_stream": "/video-feed/text-detection",
+            "start_stream": "/start-stream"
+        },
+        "config": {
+            "ocr_confidence_threshold": ocr_conf_threshold,
+            "min_text_length": min_text_length,
+            "device": device
+        }
+    }
+
+
+@app.get("/config")
+def get_config():
+    return {
+        "ocr_conf_threshold": ocr_conf_threshold,
+        "min_text_length": min_text_length,
+        "device": device
+    }
+
+
+@app.post("/config")
+async def update_config(config_data: dict):
+    global ocr_conf_threshold, min_text_length
+    
+    if "ocr_conf_threshold" in config_data:
+        ocr_conf_threshold = float(config_data["ocr_conf_threshold"])
+    
+    if "min_text_length" in config_data:
+        min_text_length = int(config_data["min_text_length"])
+    
+    return {
+        "message": "Config updated successfully",
+        "new_config": {
+            "ocr_conf_threshold": ocr_conf_threshold,
+            "min_text_length": min_text_length
+        }
+    }

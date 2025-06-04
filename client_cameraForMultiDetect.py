@@ -8,6 +8,7 @@ import numpy as np
 
 async def send_frames(uri):
     cap = cv2.VideoCapture(0)
+    # cap = cv2.VideoCapture("rtsp://<username>:<password>@<ip_address>:<port>/path") # Thay bằng rtsp camera
     if not cap.isOpened():
         print("[ERROR] Cannot open webcam")
         return

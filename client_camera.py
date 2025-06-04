@@ -65,6 +65,9 @@ async def send_and_receive(uri, label):
 
                     elif label == "Container" and data.get("containers"):
                         print(f"[{label}] Container(s): {data['containers']}")
+                    
+                    elif label == "Text" and data.get("Texts"):
+                        print(f"[{label}] Text(s): {data['texts']}")
 
         except Exception as e:
             print(f"[ERROR] {label} Error: {e}, reconnecting in 5s ...")
@@ -76,6 +79,7 @@ async def main():
         asyncio.create_task(send_and_receive('ws://localhost:8001/ws/plate-detection', 'Plate')),
         asyncio.create_task(send_and_receive('ws://localhost:8002/ws/container-detection', 'Container')),
         asyncio.create_task(send_and_receive('ws://localhost:8003/ws/face-detection', 'Face')),
+        asyncio.create_task(send_and_receive('ws://localhost:8004/ws/text-detection', 'Text')),
     ]
     await asyncio.gather(*tasks)
 
