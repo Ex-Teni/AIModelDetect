@@ -77,7 +77,7 @@ async def send_frames(uri):
                         
                         # In detections ra console (mỗi 30 frame để tránh spam)
                         frame_count += 1
-                        if frame_count % 30 == 0:
+                        if frame_count % 10 == 0:
                             detections = data.get("detections", [])
                             metadata = data.get("metadata", {})
                             
@@ -95,10 +95,10 @@ async def send_frames(uri):
                 except Exception as e:
                     print(f"[ERROR] Cannot decode annotated image: {e}")
                 
-                # Check for quit
+                # Check for quit (Comment đoạn này khi kết nối Camera)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     print("[INFO] Quit requested by user")
-                    break
+                    break 
                 
                 # Điều chỉnh FPS (30fps ~ 0.033s, 15fps ~ 0.067s)
                 await asyncio.sleep(0.033)  # ~30 FPS

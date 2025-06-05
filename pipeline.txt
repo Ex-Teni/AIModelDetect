@@ -1,0 +1,22 @@
+----------------PIPELINE: Client_camera --> API --> Frontend-----------------
+
+-Client_camera: Lấy dữ liệu từ Camera và truyền đến API
+-API: Sử dụng 3 model AI:
+    *detect_PlateNumber.pt: model YOLOv8s xác định biển số
+    *detect_ContainerCode.pt: model YOLOv8s xác định mã số container
+    *face_classifier.joblit: model MTCNN nhận diện khuôn mặt
+    *label_encoder.joblib: chứa thông tin dùng để phân biệt các khuôn mặt
+ 
+-Chạy server API:
+    API PlateNumber_api.py: python -m uvicorn API.PlateNumber_api:app --host 0.0.0.0 --port 8001 --reload
+        --> Detect biển số xe
+    API ContainerCode_api.py: python -m uvicorn API.ContainerCode_api:app --host 0.0.0.0 --port 8002 --reload
+        --> Detect số container
+    API Face_api.py: python -m uvicorn API.Face_api:app --host 0.0.0.0 --port 8003 --reload
+        --> Detect khuôn mặt
+
+    API multiDetect_api.py: python -m uvicorn API.multiDetect_api:app --host 0.0.0.0 --port 8000 --reload
+        --> Detect biển số xe, số container, khuôn mặt, số seal
+
+-Thứ tự chạy:
+    * Chạy server API --> chạy client-camera --> chạy Frontend
