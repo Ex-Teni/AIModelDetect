@@ -1,4 +1,4 @@
-# multiDetect_api.py - MODIFIED WITH EASYOCR + SEAL DETECTION
+
 import asyncio
 import subprocess
 import time
@@ -9,6 +9,7 @@ import base64
 import numpy as np
 import joblib
 import easyocr
+import re
 from fastapi import FastAPI, WebSocket, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,6 +23,213 @@ import threading
 from typing import List, Dict, Any
 
 app = FastAPI()
+
+# ====== Cải tiến OCR =====
+def preprocess_image_for_ocr(image):
+    """
+    Tiền xử lý ảnh để cải thiện độ chính xác OCR
+    """
+    # Chuyển sang grayscale
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image.copy()
+    
+    # Làm mờ nhẹ để giảm noise
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+    
+    # Tăng độ tương phản
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    enhanced = clahe.apply(blurred)
+    
+    # Threshold để tạo ảnh đen trắng rõ nét
+    _, binary = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    return binary
+
+def detect_rotation_angle(image):
+    """
+    Phát hiện góc xoay của text để xử lý số container dọc
+    """
+    # Tìm contours
+    contours, _ = cv2.findContours(image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if not contours:
+        return 0
+    
+    # Lấy contour lớn nhất
+    largest_contour = max(contours, key=cv2.contourArea)
+    
+    # Tính góc nghiêng
+    rect = cv2.minAreaRect(largest_contour)
+    angle = rect[2]
+    
+    # Điều chỉnh góc
+    if angle < -45:
+        angle = -(90 + angle)
+    else:
+        angle = -angle
+    
+    return angle
+
+def rotate_image(image, angle):
+    """
+    Xoay ảnh theo góc cho trước
+    """
+    if abs(angle) < 5:  # Không cần xoay nếu góc quá nhỏ
+        return image
+    
+    h, w = image.shape[:2]
+    center = (w // 2, h // 2)
+    
+    # Ma trận xoay
+    rotation_matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+    
+    # Tính kích thước mới
+    cos_angle = abs(rotation_matrix[0, 0])
+    sin_angle = abs(rotation_matrix[0, 1])
+    new_w = int((h * sin_angle) + (w * cos_angle))
+    new_h = int((h * cos_angle) + (w * sin_angle))
+    
+    # Điều chỉnh ma trận để không bị cắt
+    rotation_matrix[0, 2] += (new_w / 2) - center[0]
+    rotation_matrix[1, 2] += (new_h / 2) - center[1]
+    
+    # Xoay ảnh
+    rotated = cv2.warpAffine(image, rotation_matrix, (new_w, new_h), 
+                            flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    
+    return rotated
+
+
+def extract_plate_text_advanced(image_crop):
+    """
+    OCR nâng cao cho biển số xe (hỗ trợ 2 dòng)
+    """
+    try:
+        # Tiền xử lý ảnh
+        processed = preprocess_image_for_ocr(image_crop)
+        
+        # Resize để cải thiện OCR
+        height, width = processed.shape
+        if height < 60:
+            scale = 60 / height
+            new_width = int(width * scale)
+            processed = cv2.resize(processed, (new_width, 60), interpolation=cv2.INTER_CUBIC)
+        
+        # Chuyển sang RGB cho EasyOCR
+        if len(processed.shape) == 2:
+            rgb_image = cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB)
+        else:
+            rgb_image = cv2.cvtColor(processed, cv2.COLOR_BGR2RGB)
+        
+        # Sử dụng EasyOCR với cấu hình tối ưu cho biển số
+        results = easyocr_reader.readtext(
+            rgb_image,
+            detail=1,
+            paragraph=False,  # Đọc từng dòng riêng biệt
+            width_ths=0.7,   # Ngưỡng để tách các từ
+            height_ths=0.7   # Ngưỡng để tách các dòng
+        )
+        
+        if not results:
+            return None, 0.0
+        
+        # Xử lý kết quả cho biển số 2 dòng
+        texts = []
+        confidences = []
+        
+        # Sắp xếp results theo tọa độ Y (từ trên xuống dưới)
+        results_sorted = sorted(results, key=lambda x: x[0][0][1])  # Sort by Y coordinate
+        
+        for result in results_sorted:
+            bbox, text, confidence = result
+            if confidence >= OCR_CONFIDENCE_THRESHOLD:
+                # Làm sạch text
+                cleaned_text = re.sub(r'[^A-Z0-9]', '', text.upper())
+                if len(cleaned_text) >= 2:  # Chỉ giữ text có ít nhất 2 ký tự
+                    texts.append(cleaned_text)
+                    confidences.append(confidence)
+        
+        if not texts:
+            return None, 0.0
+        
+        # Ghép các dòng text lại (với dấu cách hoặc dấu gạch ngang)
+        if len(texts) > 1:
+            final_text = '-'.join(texts)  # Hoặc ' '.join(texts)
+        else:
+            final_text = texts[0]
+        
+        avg_confidence = sum(confidences) / len(confidences)
+        
+        return final_text, avg_confidence
+        
+    except Exception as e:
+        print(f"[ERROR] Advanced plate OCR failed: {e}")
+        return None, 0.0
+
+def extract_container_text_advanced(image_crop):
+    """
+    OCR nâng cao cho container code (hỗ trợ text dọc)
+    """
+    try:
+        # Tiền xử lý ảnh
+        processed = preprocess_image_for_ocr(image_crop)
+        
+        # Phát hiện góc xoay
+        angle = detect_rotation_angle(processed)
+        
+        # Thử nhiều góc xoay khác nhau
+        angles_to_try = [0, angle, 90, -90, 180]
+        best_result = None
+        best_confidence = 0.0
+        
+        for test_angle in angles_to_try:
+            # Xoay ảnh
+            if test_angle != 0:
+                rotated = rotate_image(processed, test_angle)
+            else:
+                rotated = processed
+            
+            # Resize để cải thiện OCR
+            height, width = rotated.shape
+            if height < 80 or width < 200:
+                scale = max(80 / height, 200 / width)
+                new_height = int(height * scale)
+                new_width = int(width * scale)
+                rotated = cv2.resize(rotated, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
+            
+            # Chuyển sang RGB
+            if len(rotated.shape) == 2:
+                rgb_image = cv2.cvtColor(rotated, cv2.COLOR_GRAY2RGB)
+            else:
+                rgb_image = cv2.cvtColor(rotated, cv2.COLOR_BGR2RGB)
+            
+            # OCR với EasyOCR
+            results = easyocr_reader.readtext(
+                rgb_image,
+                detail=1,
+                paragraph=True,   # Ghép thành đoạn văn
+                allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'  # Chỉ cho phép chữ và số
+            )
+            
+            for result in results:
+                bbox, text, confidence = result
+                if confidence > best_confidence: # type: ignore
+                    # Làm sạch text container
+                    cleaned_text = re.sub(r'[^A-Z0-9]', '', text.upper())
+                    if len(cleaned_text) >= 4:  # Container code thường dài ít nhất 4 ký tự
+                        best_result = cleaned_text
+                        best_confidence = confidence
+        
+        if best_result and best_confidence >= OCR_CONFIDENCE_THRESHOLD: # type: ignore
+            return best_result, best_confidence
+        else:
+            return None, best_confidence
+            
+    except Exception as e:
+        print(f"[ERROR] Advanced container OCR failed: {e}")
+        return None, 0.0
 
 # ===== GLOBAL VARIABLES =====
 latest_frame = None
@@ -70,6 +278,21 @@ face_transform = transforms.Compose([
 ])
 
 # ===== Helper: decode/encode base64 ↔ image =====
+# ===== THÊM CẤU HÌNH CHO EASYOCR =====
+def initialize_easyocr_reader():
+    """
+    Khởi tạo EasyOCR reader với cấu hình tối ưu
+    """
+    return easyocr.Reader(
+        ['en'], 
+        gpu=(device == 'cuda'),
+        model_storage_directory='easyocr_models',  # Thư mục lưu models
+        download_enabled=True,
+        detector=True,
+        recognizer=True,
+        verbose=False
+    )
+
 def decode_base64_to_image(b64: str):
     try:
         img_data = base64.b64decode(b64)
@@ -116,7 +339,7 @@ def extract_text_with_easyocr(image_crop, confidence_threshold=OCR_CONFIDENCE_TH
         print(f"[ERROR] EasyOCR extraction failed: {e}")
         return None, 0.0
 
-# ===== NEW: Direct Seal OCR Detection =====
+# ===== Direct Seal OCR Detection =====
 def detect_seal_text(frame):
     """
     Detect Seal text directly from frame using EasyOCR
@@ -242,9 +465,6 @@ def filter_seal_text(text):
     if not any(c.isalnum() for c in text):
         return None
     
-    # Có thể thêm thêm logic filter khác ở đây
-    # Ví dụ: filter theo pattern của Seal number
-    
     return text.upper().strip()
 
 # ===== Streamming =====
@@ -283,7 +503,6 @@ def detect_plates(frame):
         conf = float(box.conf[0])
         x1, y1, x2, y2 = map(int, box.xyxy[0])
         
-        # Nếu confidence < 0.1 thì trả Unknown
         if conf < 0.1:
             results.append({
                 "type": "plate",
@@ -304,33 +523,19 @@ def detect_plates(frame):
             continue
             
         cropped = frame[y1_clamped:y2_clamped, x1_clamped:x2_clamped]
-        
-        # Resize để cải thiện OCR (tùy chọn)
-        if cropped.shape[0] < 50 or cropped.shape[1] < 150:
-            scale_factor = max(50 / cropped.shape[0], 150 / cropped.shape[1])
-            new_height = int(cropped.shape[0] * scale_factor)
-            new_width = int(cropped.shape[1] * scale_factor)
-            cropped = cv2.resize(cropped, (new_width, new_height))
 
-        # Sử dụng EasyOCR thay vì model AI
-        recognized_text, ocr_confidence = extract_text_with_easyocr(cropped)
+        # SỬ DỤNG HÀM OCR NÂNG CAO
+        recognized_text, ocr_confidence = extract_plate_text_advanced(cropped)
         
-        if recognized_text is not None:
-            results.append({
-                "type": "plate",
-                "box": [x1, y1, x2, y2],
-                "text": recognized_text,
-                "confidence": ocr_confidence
-            })
-        else:
-            results.append({
-                "type": "plate",
-                "box": [x1, y1, x2, y2],
-                "text": None,
-                "confidence": ocr_confidence
-            })
+        results.append({
+            "type": "plate",
+            "box": [x1, y1, x2, y2],
+            "text": recognized_text,
+            "confidence": ocr_confidence if recognized_text else conf
+        })
     
     return results
+
 
 # ===== Detect Container - MODIFIED TO USE EASYOCR =====
 def detect_containers(frame):
@@ -361,31 +566,16 @@ def detect_containers(frame):
             continue
             
         cropped = frame[y1_clamped:y2_clamped, x1_clamped:x2_clamped]
-        
-        # Resize để cải thiện OCR (tùy chọn)
-        if cropped.shape[0] < 50 or cropped.shape[1] < 150:
-            scale_factor = max(50 / cropped.shape[0], 150 / cropped.shape[1])
-            new_height = int(cropped.shape[0] * scale_factor)
-            new_width = int(cropped.shape[1] * scale_factor)
-            cropped = cv2.resize(cropped, (new_width, new_height))
 
-        # Sử dụng EasyOCR thay vì model AI
-        recognized_text, ocr_confidence = extract_text_with_easyocr(cropped)
+        # SỬ DỤNG HÀM OCR NÂNG CAO
+        recognized_text, ocr_confidence = extract_container_text_advanced(cropped)
         
-        if recognized_text is not None:
-            results.append({
-                "type": "container",
-                "box": [x1, y1, x2, y2],
-                "text": recognized_text,
-                "confidence": ocr_confidence
-            })
-        else:
-            results.append({
-                "type": "container",
-                "box": [x1, y1, x2, y2],
-                "text": None,
-                "confidence": ocr_confidence
-            })
+        results.append({
+            "type": "container",
+            "box": [x1, y1, x2, y2],
+            "text": recognized_text,
+            "confidence": ocr_confidence if recognized_text else conf
+        })
     
     return results
 

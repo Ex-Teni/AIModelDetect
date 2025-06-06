@@ -1,22 +1,52 @@
 ----------------PIPELINE: Client_camera --> API --> Frontend-----------------
 
--Client_camera: Lấy dữ liệu từ Camera và truyền đến API
--API: Sử dụng 3 model AI:
+* Client_camera: Lấy dữ liệu từ Camera và truyền đến API
+* API: Sử dụng 3 model AI:
     *detect_PlateNumber.pt: model YOLOv8s xác định biển số
     *detect_ContainerCode.pt: model YOLOv8s xác định mã số container
     *face_classifier.joblit: model MTCNN nhận diện khuôn mặt
-    *label_encoder.joblib: chứa thông tin dùng để phân biệt các khuôn mặt
- 
--Chạy server API:
-    API PlateNumber_api.py: python -m uvicorn API.PlateNumber_api:app --host 0.0.0.0 --port 8001 --reload
+    *label_encoder.joblib: chứa dữ liệu dùng để phân biệt các khuôn mặt
+* Chạy server API:
+    - API PlateNumber_api.py: python -m uvicorn API.PlateNumber_api:app --host 0.0.0.0 --port 8001 --reload
         --> Detect biển số xe
-    API ContainerCode_api.py: python -m uvicorn API.ContainerCode_api:app --host 0.0.0.0 --port 8002 --reload
+    - API ContainerCode_api.py: python -m uvicorn API.ContainerCode_api:app --host 0.0.0.0 --port 8002 --reload
         --> Detect số container
-    API Face_api.py: python -m uvicorn API.Face_api:app --host 0.0.0.0 --port 8003 --reload
+    - API Face_api.py: python -m uvicorn API.Face_api:app --host 0.0.0.0 --port 8003 --reload
         --> Detect khuôn mặt
-
-    API multiDetect_api.py: python -m uvicorn API.multiDetect_api:app --host 0.0.0.0 --port 8000 --reload
+    - API multiDetect_api.py: python -m uvicorn API.multiDetect_api:app --host 0.0.0.0 --port 8000 --reload
         --> Detect biển số xe, số container, khuôn mặt, số seal
 
--Thứ tự chạy:
-    * Chạy server API --> chạy client-camera --> chạy Frontend
+* Thứ tự chạy:  Chạy server API --> chạy client-camera --> chạy Frontend
+
+* Task: 
+_ Viết hàm đánh giá độ chính xác
+_ Lấy dữ liệu ảnh từ folder, dữ liệu > 1000 ảnh 
+_ Lưu kết quả đánh giá ra file csv, so sánh kết quả AI vs kết quả thực tế
+    + 1: Trùng kết quả
+    + 0: Sai kết quả
+_ Cải tiến độ nhận diện AI 
+_ Dữ liệu file csv:
+    + Tên ảnh
+    + Loại model detect
+    + Kết quả AI 
+    + Kết quả thực tế 
+    + Thời gian trả kết quả /\ Tổng thời gian trả kết quả
+    + Thống kê số lượng ảnh chính xác/tổng số lượng ảnh /\ xác suất chính xác
+    + Thống kê số lượng ảnh thất bại /\ liệt kê các trường hợp khiến ảnh thất bại
+
+    
+* Tiêu chí đánh giá:
+_ Dễ: 
+    + Ảnh có độ sáng thích hợp
+    + Ảnh rõ nét
+    + Ảnh chứa đầy đủ đối tượng
+
+_ Trung bình:
+    + Ảnh có độ sáng thấp hoặc cao 
+    + Ảnh rõ nét
+    + Ảnh chứa đối tượng bị cắt
+
+_ Khó:
+    + Ảnh có độ sáng ko rõ ràng
+    + Ảnh mờ, nhiễu, có vật cản chặn đối tượng
+    + Ảnh chứa đối tượng ko rõ ràng
