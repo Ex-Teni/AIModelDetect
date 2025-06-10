@@ -1,4 +1,3 @@
-
 import asyncio
 import subprocess
 import time
@@ -48,10 +47,7 @@ def preprocess_image_for_ocr(image):
     return binary
 
 def detect_rotation_angle(image):
-    """
-    Phát hiện góc xoay của text để xử lý số container dọc
-    """
-    # Tìm contours
+
     contours, _ = cv2.findContours(image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     if not contours:
@@ -73,9 +69,7 @@ def detect_rotation_angle(image):
     return angle
 
 def rotate_image(image, angle):
-    """
-    Xoay ảnh theo góc cho trước
-    """
+    
     if abs(angle) < 5:  # Không cần xoay nếu góc quá nhỏ
         return image
     
@@ -103,9 +97,6 @@ def rotate_image(image, angle):
 
 
 def extract_plate_text_advanced(image_crop):
-    """
-    OCR nâng cao cho biển số xe (hỗ trợ 2 dòng)
-    """
     try:
         # Tiền xử lý ảnh
         processed = preprocess_image_for_ocr(image_crop)
@@ -128,8 +119,8 @@ def extract_plate_text_advanced(image_crop):
             rgb_image,
             detail=1,
             paragraph=False,  # Đọc từng dòng riêng biệt
-            width_ths=0.7,   # Ngưỡng để tách các từ
-            height_ths=0.7   # Ngưỡng để tách các dòng
+            width_ths=0.2,   # Ngưỡng để tách các từ
+            height_ths=0.2   # Ngưỡng để tách các dòng
         )
         
         if not results:
@@ -140,11 +131,11 @@ def extract_plate_text_advanced(image_crop):
         confidences = []
         
         # Sắp xếp results theo tọa độ Y (từ trên xuống dưới)
-        results_sorted = sorted(results, key=lambda x: x[0][0][1])  # Sort by Y coordinate
+        results_sorted = sorted(results, key=lambda x: x[0][0][1])  # type: ignore 
         
         for result in results_sorted:
             bbox, text, confidence = result
-            if confidence >= OCR_CONFIDENCE_THRESHOLD:
+            if confidence >= OCR_CONFIDENCE_THRESHOLD: # type: ignore
                 # Làm sạch text
                 cleaned_text = re.sub(r'[^A-Z0-9]', '', text.upper())
                 if len(cleaned_text) >= 2:  # Chỉ giữ text có ít nhất 2 ký tự
@@ -169,9 +160,6 @@ def extract_plate_text_advanced(image_crop):
         return None, 0.0
 
 def extract_container_text_advanced(image_crop):
-    """
-    OCR nâng cao cho container code (hỗ trợ text dọc)
-    """
     try:
         # Tiền xử lý ảnh
         processed = preprocess_image_for_ocr(image_crop)
@@ -254,14 +242,11 @@ SEAL_OCR_CONFIDENCE_THRESHOLD = 0.3  # ngưỡng thấp hơn cho Seal vì có th
 plate_model = YOLO("modelAI/detect_PlateNumber.pt")
 container_model = YOLO("modelAI/detect_ContainerCode.pt")
 
-# EasyOCR Reader - khởi tạo một lần
 easyocr_reader = easyocr.Reader(['en'], gpu=(device == 'cuda'))
 
-# MTCNN + FaceNet
 mtcnn = MTCNN(keep_all=True, device=device)
 facenet = InceptionResnetV1(pretrained='vggface2').eval().to(device)
 
-# Load classifier và label_encoder (dùng joblib)
 try:
     classifier = joblib.load('modelAI/face_classifier.joblib')
     label_encoder = joblib.load('modelAI/label_encoder.joblib')
@@ -278,7 +263,7 @@ face_transform = transforms.Compose([
 ])
 
 # ===== Helper: decode/encode base64 ↔ image =====
-# ===== THÊM CẤU HÌNH CHO EASYOCR =====
+''' === THÊM CẤU HÌNH CHO EASYOCR === '''
 def initialize_easyocr_reader():
     """
     Khởi tạo EasyOCR reader với cấu hình tối ưu
@@ -307,10 +292,6 @@ def encode_image_to_base64(img) -> str:
 
 # ===== EasyOCR function to replace character detection =====
 def extract_text_with_easyocr(image_crop, confidence_threshold=OCR_CONFIDENCE_THRESHOLD):
-    """
-    Sử dụng EasyOCR để nhận diện text từ crop image
-    Trả về text và confidence score
-    """
     try:
         # Chuyển đổi sang RGB nếu cần
         if len(image_crop.shape) == 3 and image_crop.shape[2] == 3:
@@ -341,10 +322,6 @@ def extract_text_with_easyocr(image_crop, confidence_threshold=OCR_CONFIDENCE_TH
 
 # ===== Direct Seal OCR Detection =====
 def detect_seal_text(frame):
-    """
-    Detect Seal text directly from frame using EasyOCR
-    This function scans the entire frame for text that doesn't belong to plates or containers
-    """
     results = []
     try:
         # Chuyển đổi sang RGB
@@ -424,10 +401,6 @@ def detect_seal_text(frame):
         return []
 
 def boxes_overlap(box1, box2, threshold=0.3):
-    """
-    Kiểm tra xem 2 bounding box có overlap không
-    threshold: tỷ lệ overlap tối thiểu để coi là overlap
-    """
     x1_1, y1_1, x2_1, y2_1 = box1
     x1_2, y1_2, x2_2, y2_2 = box2
     
@@ -449,10 +422,6 @@ def boxes_overlap(box1, box2, threshold=0.3):
     return overlap_ratio > threshold
 
 def filter_seal_text(text):
-    """
-    Filter text để chỉ giữ lại những text có thể là Seal
-    Có thể customize logic này theo yêu cầu cụ thể
-    """
     # Loại bỏ text quá ngắn
     if len(text) < 3:
         return None
@@ -469,7 +438,6 @@ def filter_seal_text(text):
 
 # ===== Streamming =====
 def update_latest_frame_and_metadata(frame, metadata):
-    """Thread-safe update của frame và metadata"""
     global latest_frame, latest_metadata
     with frame_lock:
         latest_frame = frame.copy()
@@ -669,7 +637,6 @@ def process_image(frame):
 
 # ===== Extract metadata từ detections - UPDATED =====
 def extract_metadata(detections: List[Dict[str, Any]]) -> Dict[str, str]:
-    """Trích xuất metadata từ detections cho Flutter"""
     metadata = {"plate": "None", "container": "None", "face": "None", "seal": "None"}
     
     for det in detections:
@@ -707,10 +674,6 @@ def health():
 # ===== Rest of the endpoints remain unchanged =====
 @app.get("/start-stream")
 def start_stream():
-    """
-    Khi Flutter bấm 'Stream', FastAPI sẽ khởi chạy client_camera.py như subprocess.
-    Cần chắc rằng client_camera.py nằm cùng thư mục hoặc có đường dẫn chính xác.
-    """
     try:
         # Chạy client_camera.py trong background
         subprocess.Popen(["python", "client_camera.py"])
