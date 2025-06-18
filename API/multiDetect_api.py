@@ -10,6 +10,9 @@ import joblib
 import re
 import easyocr
 import threading
+import pytesseract
+import concurrent.futures
+from paddleocr import PaddleOCR
 from transformers import TrOCRProcessor, VisionEncoderDecoderModel
 from fastapi import FastAPI, WebSocket, HTTPException
 from fastapi.responses import JSONResponse
@@ -21,28 +24,21 @@ from ultralytics import YOLO
 from torchvision import transforms
 from PIL import Image
 from starlette.websockets import WebSocketDisconnect
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Tuple
 from contextlib import asynccontextmanager
+
 
 # ===== GLOBAL VARIABLES =====
 app = FastAPI()
-reader = easyocr.Reader(['en'], gpu=torch.cuda.is_available())
-
-latest_frame = None
-latest_metadata = {"plate": "None", "container": "None", "face": "None", "seal": "None"}
-frame_lock = threading.Lock()
-
-# ===== CORS MIDDLEWARE =====
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ===== CONFIGURATION =====
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
+
+class GlobalState:
+    def __init__(self):
+        self.latest_frame = None
+        self.latest_metadata = {"plate": "None", "container": "None", "face": "None", "seal": "None"}
+        self.frame_lock = threading.Lock()
+        self.models_loaded = False
 
 # Detection thresholds
 FACE_CONFIDENCE_THRESHOLD = 0.95  # Face detection threshold
@@ -58,77 +54,138 @@ PING_TIMEOUT = 5        # seconds
 IMAGE_PROCESSING_TIMEOUT = 25  # seconds (less than WebSocket timeout)
 OCR_TIMEOUT = 5  # seconds per OCR operation
 
+# ===== CORS MIDDLEWARE =====
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # ===== MODEL INITIALIZATION =====
-# YOLO models
-plate_model = YOLO("modelAI/detect_PlateNumber.pt")
-container_model = YOLO("modelAI/detect_ContainerCode.pt")
+class ModelManager:
+    def __init__(self):
+        self.yolo_models = {}
+        self.face_models = {}
+        self.ocr_models = None 
+        self.face_classifier = None 
+        self.label_encoder = None 
+        self.face_transform = None
+    
+    def load_models(self):
+        """Gọi model từ folde modelAI"""
+        try:
+            print(f"[INFO] Loading all model...")
+            self.yolo_models['plate'] = YOLO("modelAI/detect_PlateNumber.pt")
+            self.yolo_models['container'] = YOLO("modelAI/detect_ContainerCode.pt")
+            self.yolo_models['character'] = YOLO("modelAI/detect_Character.pt")
+            self.face_models['mtcnn'] = MTCNN(keep_all=True, device=device)
+            self.face_models['facenet'] = InceptionResnetV1(pretrained='vggface2').eval().to(device)
 
-# TrOCR initialization
-try:
-    trocr_processor = TrOCRProcessor.from_pretrained("microsoft/trocr-base-printed")
-    trocr_model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-base-printed")
-    print("TrOCR models loaded successfully")
-except Exception as e:
-    print(f"Error loading TrOCR: {e}")
-    trocr_processor = None
-    trocr_model = None
+            try: 
+                self.face_classifier = joblib.load('modelAI/face_classifier.joblib')
+                self.label_encoder = joblib.load('modelAI/label_encoder.joblib')
+                print("[INFO] Face classifier loaded successfully")
+            except Exception as e:
+                print(f"[WARNING] Face classifier not found: {e}")
+                self.face_classifier = None
+                self.label_encoder = None
 
-# Face recognition models
-mtcnn = MTCNN(keep_all=True, device=device)
-facenet = InceptionResnetV1(pretrained='vggface2').eval().to(device)
-classifier = joblib.load('modelAI/face_classifier.joblib')
-label_encoder = joblib.load('modelAI/label_encoder.joblib')
+            self.face_transform = transforms.Compose([
+                transforms.Resize((160, 160)),
+                transforms.ToTensor(),
+                transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+            ])
+            self.ocr_models = OCRModels()
+            print(f"[INFO] All models load successfully")
+            return True
+        except Exception as e:
+            print(f"[ERROR] Failed to load models: {e}")
+            return False
+        
+global_state = GlobalState()
+model_manager = ModelManager()
 
-# Face preprocessing transform
-face_transform = transforms.Compose([
-    transforms.Resize((160, 160)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
-])
+# Load models khi khởi động
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    print("[STARTUP] Loading models...")
+    success = model_manager.load_models()
+    if success:
+        global_state.models_loaded = True
+        print("[STARTUP] All models loaded successfully")
+    else:
+        print("[STARTUP] Failed to load models")
+    yield
+    # Shutdown
+    print("[SHUTDOWN] Server shutting down")
+app = FastAPI(lifespan=lifespan)
+
+# OCR init
+class OCRModels:
+    def __init__(self):
+
+        # PaddleOCR init
+        try:
+            self.paddle_ocr = PaddleOCR(
+                use_angle_cls=True,
+                lang="en",
+                # Removed show_log parameter as it's not supported
+            )
+            print("[INFO] PaddleOCR initialized successfully")
+        except Exception as e:
+            print(f"[ERROR] PaddleOCR initialization failed: {e}")
+            self.paddle_ocr = None
+
+        self.easy_ocr = easyocr.Reader(['en'], gpu=torch.cuda.is_available())
+
+        # TrOCR fallback
+        try:
+            self.trocr_processor = TrOCRProcessor.from_pretrained("microsoft/trocr-base-printed")
+            self.trocr_model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-base-printed")
+            print("[INFO] TrOCR models loaded successfully")
+        except Exception as e:
+            self.trocr_processor = None
+            self.trocr_model = None
+            print(f"[WARNING] TrOCR models failed to load: {e}")
+
+        # Tesseract config
+        self.plate_config = r'--oem 3 --psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'
+        self.container_config = r'--oem 3 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
 
 # ===== UTILITY FUNCTIONS =====
-def decode_base64_to_image(b64: str):
+def decode_base64_to_image(b64: str) -> Optional[np.ndarray]:
     """Decode base64 string to OpenCV image"""
     try:
         img_data = base64.b64decode(b64)
         arr = np.frombuffer(img_data, np.uint8)
         return cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    except Exception:
+    except Exception as e:
+        print(f"[ERROR] Base64 decode failed: {e}")
         return None
 
-def encode_image_to_base64(img) -> str:
+def encode_image_to_base64(img: np.ndarray) -> str:
     """Encode OpenCV image to base64 string"""
     _, buff = cv2.imencode(".jpg", img)
     return base64.b64encode(buff).decode("utf-8") # type: ignore
 
-def timeout_handler_threaded(timeout_seconds):
-    """Decorator for handling function timeouts using threading"""
+def timeout_with_executor(timeout_seconds: float):
+    """Windows-compatible timeout decorator using ThreadPoolExecutor"""
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
-            result = [None]
-            exception = [None]
-            
-            def target():
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                 try:
-                    result[0] = func(*args, **kwargs)
+                    future = executor.submit(func, *args, **kwargs)
+                    result = future.result(timeout=timeout_seconds)
+                    return result
+                except concurrent.futures.TimeoutError:
+                    print(f"[TIMEOUT] {func.__name__} timed out after {timeout_seconds}s")
+                    return None, 0.0 if func.__name__.startswith('extract_text') else None
                 except Exception as e:
-                    exception[0] = e # type: ignore
-            
-            thread = threading.Thread(target=target)
-            thread.daemon = True
-            thread.start()
-            thread.join(timeout_seconds)
-            
-            if thread.is_alive():
-                print(f"[TIMEOUT] {func.__name__} timed out after {timeout_seconds}s")
-                return None, 0.0
-            
-            if exception[0]:
-                print(f"[ERROR] {func.__name__} failed: {exception[0]}")
-                return None, 0.0
-                
-            return result[0] if result[0] is not None else (None, 0.0)
+                    print(f"[ERROR] {func.__name__} failed: {e}")
+                    return None, 0.0 if func.__name__.startswith('extract_text') else None
         return wrapper
     return decorator
 
@@ -150,8 +207,10 @@ def boxes_overlap(box1, box2, threshold=0.3):
     box1_area = (x2_1 - x1_1) * (y2_1 - y1_1)
     box2_area = (x2_2 - x1_2) * (y2_2 - y1_2)
     
-    # Calculate overlap ratio
-    overlap_ratio = intersection_area / min(box1_area, box2_area) if min(box1_area, box2_area) > 0 else 0
+    if min(box1_area, box2_area) <= 0:
+        return False
+    
+    overlap_ratio = intersection_area / min(box1_area, box2_area)
     return overlap_ratio > threshold
 
 def remove_duplicate_detections(detections):
@@ -177,35 +236,32 @@ def remove_duplicate_detections(detections):
     return filtered
 
 # ===== TEXT PROCESSING FUNCTIONS =====
-def clean_text(text, text_type):
-    """Clean and validate OCR text based on type"""
-    if not text:
-        return None
-    
-    # Convert to uppercase and remove leading/trailing spaces
-    text = text.strip().upper()
+def detect_text_orientation(image: np.ndarray) -> str:
+    """Phát hiện hướng của text (horizontal/vertical)"""
+    try:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+        edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+        lines = cv2.HoughLines(edges, 1, np.pi/180, threshold=20)
+        
+        if lines is None:
+            return "horizontal"
+        
+        horizontal_count = 0
+        vertical_count = 0
 
-    if text_type == "plate":
-        # License plate: keep only letters, numbers, and hyphens
-        text = re.sub(r'[^A-Z0-9\-]', '', text)
-        if len(text) < 2:
-            return None
+        for line in lines:
+            rho, theta = line[0]
+            angle = theta * 180 / np.pi
+
+            if angle < 10 or angle > 170:
+                horizontal_count += 1
+            elif 80 < angle < 100:
+                vertical_count += 1
         
-    elif text_type == "container":
-        # Container code: keep only letters and numbers
-        text = re.sub(r'[^A-Z0-9]', '', text)
-        # Common OCR corrections
-        text = text.replace('O', '0').replace('I', '1')
-        if len(text) < 4:
-            return None
-        
-    elif text_type == "seal":
-        # Seal: more flexible, allow word characters, hyphens, and dots
-        text = re.sub(r'[^\w\-\.]', '', text)
-        if len(text) < 2:
-            return None
-    
-    return text if text else None
+        return "vertical" if vertical_count > horizontal_count else "horizontal"
+    except Exception as e:
+        print(f"[FAILED] Text orientation detection failed: {e}")
+        return "horizontal"
 
 def preprocess_image_for_ocr(image):
     """Preprocess image to improve OCR accuracy"""
@@ -249,57 +305,141 @@ def preprocess_image_for_ocr(image):
     rgb_image = cv2.cvtColor(best_image, cv2.COLOR_GRAY2RGB)
     return rgb_image
 
-# ===== OCR FUNCTIONS =====
-@timeout_handler_threaded(OCR_TIMEOUT)
-def extract_text_with_trocr_fast(image_crop, text_type="plate"):
-    """Fast TrOCR extraction with timeout protection"""
-    if trocr_processor is None or trocr_model is None:
-        return None, 0.0
+def preprocess_for_multiline_text(image):
+    """Tiền xử lý ảnh cho văn bản nhiều dòng"""
     
-    try:
-        # Simplified preprocessing
-        if len(image_crop.shape) == 3:
-            gray = cv2.cvtColor(image_crop, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = image_crop.copy()
-        
-        # Quick resize if too small
-        h, w = gray.shape
-        if h < 32 or w < 100:
-            scale = max(32 / h, 100 / w)
-            gray = cv2.resize(gray, (int(w * scale), int(h * scale)))
-        
-        # Convert to RGB
-        rgb_image = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
-        pil_image = Image.fromarray(rgb_image)
+    # Convert to grayscale if needed
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image.copy()
+    
+    # Method 1: Denoising + CLAHE
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
 
-        # Quick TrOCR inference
-        with torch.no_grad():
-            inputs = trocr_processor(images=pil_image, return_tensors="pt").to(device) # type: ignore
-            outputs = trocr_model.generate(**inputs, max_length=30)  # Reduced max_length for speed
-            text = trocr_processor.batch_decode(outputs, skip_special_tokens=True)[0].strip() # type: ignore
+    # Noise reduction
+    denoised = cv2.fastNlMeansDenoising(enhanced, None, 10, 7, 21)
 
-        if not text:
-            return None, 0.0
-        
-        cleaned_text = clean_text(text, text_type)
-        confidence = 0.8 if cleaned_text else 0.0
-        return cleaned_text, confidence
-        
-    except Exception as e:
-        print(f"[ERROR] Fast TrOCR failed: {e}")
-        return None, 0.0
+    # Morphological operations to connect text
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 1))
+    morph = cv2.morphologyEx(denoised, cv2.MORPH_CLOSE, kernel)
+    
+    return morph
 
-@timeout_handler_threaded(OCR_TIMEOUT)
-def extract_text_with_easyocr_fast(image_crop, text_type="plate"):
+def preprocess_for_vertical_text(image):
+    """Tiền xử lý hình ảnh cho văn bản đọc"""
+    
+    # Convert to grayscale if needed
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image.copy()
+    
+    # Resize if too small
+    h, w = gray.shape
+    if h < 100:
+        scale = 100 / h
+        gray = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+    
+    # Enhance contrast specifically for vertical text
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(2, 8))
+    enhanced = clahe.apply(gray)
+    
+    # Vertical morphological operations
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))
+    morph = cv2.morphologyEx(enhanced, cv2.MORPH_CLOSE, kernel)
+    
+    return morph
+
+
+def clean_text(text: str, text_type: str) -> Optional[str]:
+    """Clean and validate OCR text based on type"""
+    if not text:
+        return None
+    
+    # Convert to uppercase and remove leading/trailing spaces
+    text = text.strip().upper()
+
+    if text_type == "plate":
+        # License plate: keep only letters, numbers, and hyphens
+        text = re.sub(r'[^A-Z0-9\-]', '', text)
+        if len(text) < 2:
+            return None
+        
+    elif text_type == "container":
+        # Container code: keep only letters and numbers
+        text = re.sub(r'[^A-Z0-9]', '', text)
+        # Common OCR corrections
+        text = text.replace('O', '0').replace('I', '1')
+        if len(text) < 4:
+            return None
+        
+    elif text_type == "seal":
+        # Seal: more flexible, allow word characters, hyphens, and dots
+        text = re.sub(r'[^\w\-\.]', '', text)
+        if len(text) < 2:
+            return None
+    
+    return text if text else None
+
+def clean_plate_text(text: str) -> Optional[str]:
+    """Xử lý text biển số xe 2 dòng"""
+    if not text:
+        return None
+    
+    # Xoá các ký tự đặc biệt
+    text = re.sub(r'[^\w\s\-]', '', text.upper())
+
+    # Biển số xe nhiều dòng
+    lines = [line.strip() for line in text.split('\n') if line.strip()]
+    if len(lines) > 1:
+        # GHép nhiều dòng lại thành 1
+        combined = ''.join(re.sub(r'[^A-Z0-9\-]', '', line) for line in lines)
+        if len(combined) >= 4:
+            return combined
+        
+        # Tách ký tự bằng dấu gạch ngang
+        separated = '-'.join(re.sub(r'[^A-Z0-9]', '', line) for line in lines if re.sub(r'[^A-Z0-9]', '', line))
+        if len(separated) >= 4:
+            return separated
+        
+    else:
+        # Biển số 1 dòng
+        cleaned = re.sub(r'[^A-Z0-9\-]', '', text)
+        if len(cleaned) >= 2:
+            return cleaned
+    
+    return None
+
+def clean_container_text(text: str) -> Optional[str]:
+    """Xử lý text container code dọc"""
+    # Container format: 4 letters + 7 digits (e.g., ABCD1234567)
+    text = re.sub(r'[^A-Z0-9]', '', text.upper().strip())
+    
+    # Common OCR corrections
+    text = text.replace('O', '0').replace('I', '1').replace('S', '5')
+    
+    # Validate container format (at least 4 characters)
+    if len(text) >= 4:
+        return text
+    
+    return None
+
+# ===== OCR FUNCTIONS =====
+@timeout_with_executor(OCR_TIMEOUT)
+def extract_text_with_easyocr_fast(image_crop: np.ndarray, text_type: str = "plate") -> Tuple[Optional[str], float]:
     """Fast EasyOCR extraction as fallback"""
     try:
+        if model_manager.ocr_models is None or model_manager.ocr_models.easy_ocr is None:
+            return None, 0.0
+            
         if len(image_crop.shape) == 3:
             gray = cv2.cvtColor(image_crop, cv2.COLOR_BGR2GRAY)
         else:
             gray = image_crop
             
-        results = reader.readtext(gray, detail=1, width_ths=0.7, height_ths=0.7)
+        results = model_manager.ocr_models.easy_ocr.readtext(gray, detail=1, width_ths=0.7, height_ths=0.7)
         if not results:
             return None, 0.0
             
@@ -307,25 +447,240 @@ def extract_text_with_easyocr_fast(image_crop, text_type="plate"):
         text = best_result[1] # type: ignore
         confidence = best_result[2] # type: ignore
         cleaned_text = clean_text(text, text_type)
-        return cleaned_text, confidence if cleaned_text else 0.0
+        return cleaned_text, confidence if cleaned_text else 0.0 # type: ignore
         
     except Exception as e:
-        print(f"[ERROR] Fast EasyOCR failed: {e}")
+        print(f"[FAILED] Fast EasyOCR failed: {e}")
+        return None, 0.0
+
+@timeout_with_executor(OCR_TIMEOUT)
+def extract_text_plate(image_crop: np.ndarray, ocr_models: OCRModels) -> Tuple[Optional[str], float]:
+    """Enhanced OCR for license plates with multi-line support"""
+    results = []
+    
+    try:
+        # Preprocessing for license plates
+        processed_images = []
+        
+        gray = cv2.cvtColor(image_crop, cv2.COLOR_BGR2GRAY) if len(image_crop.shape) == 3 else image_crop
+        
+        # Resize if too small
+        h, w = gray.shape
+        if h < 64 or w < 200:
+            scale = max(64/h, 200/w, 2.0)
+            gray = cv2.resize(gray, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_CUBIC)
+        
+        # Multiple preprocessing methods
+        # Method 1: CLAHE + Denoising
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        enhanced = clahe.apply(gray)
+        denoised = cv2.fastNlMeansDenoising(enhanced, None, 10, 7, 21)
+        processed_images.append(denoised)
+        
+        # Method 2: Morphological operations
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3,1))
+        morph = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
+        processed_images.append(morph)
+        
+        # Method 3: Gaussian + Threshold
+        blurred = cv2.GaussianBlur(gray, (3,3), 0)
+        _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        processed_images.append(thresh)
+        
+        # ===== OCR METHODS =====
+        
+        # 1. PaddleOCR
+        if ocr_models.paddle_ocr is not None:
+            for i, processed in enumerate(processed_images):
+                try:
+                    paddle_results = ocr_models.paddle_ocr.ocr(processed, cls=True)
+                    if paddle_results and paddle_results[0]:
+                        for line in paddle_results[0]:
+                            text = line[1][0]
+                            conf = line[1][1]
+                            cleaned = clean_plate_text(text)
+                            if cleaned and conf > 0.7:
+                                results.append((cleaned, conf, f"PaddleOCR_{i}"))
+                except Exception as e:
+                    print(f"[ERROR] PaddleOCR method {i} failed: {e}")
+        
+        # 2. EasyOCR
+        if ocr_models.easy_ocr is not None:
+            for i, processed in enumerate(processed_images):
+                try:
+                    easy_results = ocr_models.easy_ocr.readtext(
+                        processed, 
+                        allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-',
+                        width_ths=0.7, height_ths=0.7
+                    )
+                    if easy_results:
+                        best_result = max(easy_results, key=lambda x: x[2]) # type: ignore
+                        text, conf = best_result[1], best_result[2] # type: ignore
+                        cleaned = clean_plate_text(text)
+                        if cleaned and conf > 0.6: # type: ignore
+                            results.append((cleaned, conf, f"EasyOCR_{i}"))
+                            
+                except Exception as e:
+                    print(f"[ERROR] EasyOCR method {i} failed: {e}")
+        
+        # 3. Tesseract
+        for i, processed in enumerate(processed_images):
+            try:
+                text = pytesseract.image_to_string(processed, config=ocr_models.plate_config).strip()
+                if text:
+                    cleaned = clean_plate_text(text)
+                    if cleaned:
+                        results.append((cleaned, 0.7, f"Tesseract_{i}"))
+            except Exception as e:
+                print(f"[ERROR] Tesseract method {i} failed: {e}")
+        
+        # Choose best result
+        if results:
+            priority_order = ['PaddleOCR', 'EasyOCR', 'Tesseract']
+            
+            def get_priority(method_name):
+                for i, priority in enumerate(priority_order):
+                    if priority in method_name:
+                        return i
+                return len(priority_order)
+            
+            results.sort(key=lambda x: (-x[1], get_priority(x[2])))
+            best_result = results[0]
+            return best_result[0], best_result[1]
+        
+        return None, 0.0
+        
+    except Exception as e:
+        print(f"[FAILED] Enhanced plate OCR failed: {e}")
+        return None, 0.0
+
+@timeout_with_executor(OCR_TIMEOUT)
+def extract_text_container(image_crop: np.ndarray, ocr_models: OCRModels) -> Tuple[Optional[str], float]:
+    """Enhanced OCR for container codes with vertical text support"""
+    results = []
+    
+    try:
+        # Preprocessing for container codes
+        processed_images = []
+        
+        gray = cv2.cvtColor(image_crop, cv2.COLOR_BGR2GRAY) if len(image_crop.shape) == 3 else image_crop
+        
+        # Detect orientation
+        orientation = detect_text_orientation(image_crop)
+        
+        # Resize if needed
+        h, w = gray.shape
+        if h < 80 or w < 200:
+            scale = max(80/h, 200/w, 1.5)
+            gray = cv2.resize(gray, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_CUBIC)
+        
+        # Multiple preprocessing
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        enhanced = clahe.apply(gray)
+        denoised = cv2.fastNlMeansDenoising(enhanced, None, 8, 7, 21)
+        processed_images.append(denoised)
+        
+        # For vertical text
+        kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1,3))
+        morph_v = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel_v)
+        processed_images.append(morph_v)
+        
+        # Rotation handling
+        if orientation == "vertical":
+            for angle in [90, -90, 180]:
+                center = (w//2, h//2)
+                rotation_matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+                rotated = cv2.warpAffine(gray, rotation_matrix, (w, h))
+                processed_images.append(rotated)
+        
+        # ===== OCR METHODS =====
+        
+        # 1. PaddleOCR
+        if ocr_models.paddle_ocr is not None:
+            for i, processed in enumerate(processed_images):
+                try:
+                    paddle_results = ocr_models.paddle_ocr.ocr(processed, cls=True)
+                    if paddle_results and paddle_results[0]:
+                        for line in paddle_results[0]:
+                            text = line[1][0]
+                            conf = line[1][1]
+                            cleaned = clean_container_text(text)
+                            if cleaned and conf > 0.75:
+                                results.append((cleaned, conf, f"PaddleOCR_{i}"))
+                except Exception as e:
+                    print(f"[ERROR] PaddleOCR container method {i} failed: {e}")
+        
+        # 2. EasyOCR
+        if ocr_models.easy_ocr is not None:
+            for i, processed in enumerate(processed_images):
+                try:
+                    easy_results = ocr_models.easy_ocr.readtext(
+                        processed,
+                        allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+                        width_ths=0.8, height_ths=0.8
+                    )
+                    
+                    if easy_results:
+                        if orientation == "vertical":
+                            combined_text = ''.join([r[1] for r in easy_results]) # type: ignore
+                            cleaned = clean_container_text(combined_text)
+                            if cleaned:
+                                avg_conf = sum([r[2] for r in easy_results]) / len(easy_results) # type: ignore
+                                results.append((cleaned, avg_conf, f"EasyOCR_Vertical_{i}"))
+                        else:
+                            best_result = max(easy_results, key=lambda x: x[2]) # type: ignore
+                            text, conf = best_result[1], best_result[2] # type: ignore
+                            cleaned = clean_container_text(text)
+                            if cleaned and conf > 0.7: # type: ignore
+                                results.append((cleaned, conf, f"EasyOCR_{i}"))
+                                
+                except Exception as e:
+                    print(f"[ERROR] EasyOCR container method {i} failed: {e}")
+        
+        # 3. Tesseract
+        for i, processed in enumerate(processed_images):
+            try:
+                text = pytesseract.image_to_string(processed, config=ocr_models.container_config).strip()
+                if text:
+                    cleaned = clean_container_text(text)
+                    if cleaned:
+                        results.append((cleaned, 0.75, f"Tesseract_{i}"))
+            except Exception as e:
+                print(f"[ERROR] Tesseract container method {i} failed: {e}")
+        
+        # Choose best result
+        if results:
+            priority_order = ['PaddleOCR', 'EasyOCR', 'Tesseract']
+            
+            def get_priority(method_name):
+                for i, priority in enumerate(priority_order):
+                    if priority in method_name:
+                        return i
+                return len(priority_order)
+            
+            results.sort(key=lambda x: (-x[1], get_priority(x[2])))
+            best_result = results[0]
+            return best_result[0], best_result[1]
+        
+        return None, 0.0
+        
+    except Exception as e:
+        print(f"[FAILED] Enhanced container OCR failed: {e}")
         return None, 0.0
 
 # ===== DETECTION FUNCTIONS =====
-def detect_plates(frame):
+def detect_plates(frame: np.ndarray) -> List[Dict]:
     """Detect license plates in frame"""
     results = []
     try:
-        yolo_out = plate_model(frame, conf=0.1, iou=0.5)[0]
-        
+        yolo_out = model_manager.yolo_models['plate'](frame, conf=0.1, iou=0.5)[0]
+
         for box in yolo_out.boxes:
             conf = float(box.conf[0])
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             
             # Add low confidence detections without OCR
-            if conf < 0.1:
+            if conf < 0.15:
                 results.append({
                     "type": "plate",
                     "box": [x1, y1, x2, y2],
@@ -348,9 +703,7 @@ def detect_plates(frame):
             cropped = frame[y1_c:y2_c, x1_c:x2_c]
 
             # Try TrOCR first, then EasyOCR as fallback
-            text, ocr_conf = extract_text_with_trocr_fast(cropped, "plate")
-            if not text:
-                text, ocr_conf = extract_text_with_easyocr_fast(cropped, "plate")
+            text, ocr_conf = extract_text_plate(cropped, model_manager.ocr_models) # type: ignore
             
             results.append({
                 "type": "plate",
@@ -360,22 +713,22 @@ def detect_plates(frame):
             })
     
     except Exception as e:
-        print(f"[ERROR] Plate detection failed: {e}")
+        print(f"[FAILED] Plate detection failed: {e}")
     
     return results
 
-def detect_containers(frame):
+def detect_containers(frame: np.ndarray) -> List[Dict]:
     """Detect container codes in frame"""
     results = []
     try:
-        yolo_out = container_model(frame, conf=0.15, iou=0.5)[0]
+        yolo_out = model_manager.yolo_models['container'](frame, conf=0.15, iou=0.5)[0]
         
         for box in yolo_out.boxes:
             conf = float(box.conf[0])
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             
-            # Add low confidence detections without OCR
-            if conf < 0.15:
+            #  Detections without OCR
+            if conf < 0.2:
                 results.append({
                     "type": "container",
                     "box": [x1, y1, x2, y2],
@@ -396,7 +749,7 @@ def detect_containers(frame):
                 continue
                 
             cropped = frame[y1_c:y2_c, x1_c:x2_c]
-            text, ocr_conf = extract_text_with_trocr_fast(cropped, "container")
+            text, ocr_conf = extract_text_container(cropped, model_manager.ocr_models) # type: ignore
             
             results.append({
                 "type": "container",
@@ -412,7 +765,7 @@ def detect_containers(frame):
 
 def detect_faces(frame):
     """Detect and recognize faces in frame"""
-    if classifier is None or label_encoder is None:
+    if model_manager.face_classifier is None or model_manager.label_encoder is None or model_manager.face_models.get('mtcnn') is None:
         return []
 
     results = []
@@ -442,14 +795,14 @@ def detect_faces(frame):
             face_tensor = face_transform(face_pil).unsqueeze(0).to(device) # type: ignore
 
             with torch.no_grad():
-                embedding = facenet(face_tensor).cpu().numpy()
+                embedding = model_manager.face_models['facenet'](face_tensor).cpu().numpy()
 
             # Classify face
-            proba_list = classifier.predict_proba(embedding)[0]
+            proba_list = model_manager.face_classifier.predict_proba(embedding)[0]
             best_idx = np.argmax(proba_list)
             best_prob = float(proba_list[best_idx])
             
-            name = label_encoder.inverse_transform([best_idx])[0] if best_prob >= FACE_CONFIDENCE_THRESHOLD else None
+            name = model_manager.label_encoder.inverse_transform([best_idx])[0] if best_prob >= FACE_CONFIDENCE_THRESHOLD else None
 
             results.append({
                 "type": "face",
@@ -461,7 +814,7 @@ def detect_faces(frame):
         return results
 
     except Exception as e:
-        print(f"[ERROR] Face detection failed: {e}")
+        print(f"[FAILED] Face detection failed: {e}")
         return []
 
 # ===== DRAWING AND VISUALIZATION =====
@@ -491,7 +844,7 @@ def draw_detections(frame, detections):
     return frame
 
 # ===== MAIN PROCESSING FUNCTIONS =====
-@timeout_handler_threaded(IMAGE_PROCESSING_TIMEOUT)
+@timeout_with_executor(IMAGE_PROCESSING_TIMEOUT)
 def process_image(frame):
     """Main image processing function with timeout protection"""
     detections = []
@@ -530,18 +883,16 @@ def extract_metadata(detections: List[Dict[str, Any]]) -> Dict[str, str]:
 # ===== STREAMING FUNCTIONS =====
 def update_latest_frame_and_metadata(frame, metadata):
     """Update global frame and metadata for streaming"""
-    global latest_frame, latest_metadata
-    with frame_lock:
-        latest_frame = frame.copy()
-        latest_metadata = metadata.copy()
+    with global_state.frame_lock:
+        global_state.latest_frame = frame.copy()
+        global_state.latest_metadata = metadata.copy()  
 
 def generate_mjpeg():
     """Generate MJPEG stream for video feed"""
-    global latest_frame
     while True:
-        with frame_lock:
-            if latest_frame is not None:
-                current_frame = latest_frame.copy()
+        with global_state.frame_lock:
+            if global_state.latest_frame is not None:
+                current_frame = global_state.latest_frame.copy() 
             else:
                 current_frame = None
         
@@ -555,20 +906,21 @@ def generate_mjpeg():
         else:
             time.sleep(0.05)
 
-# ===== API ENDPOINTS =====
+# # ===== API ENDPOINTS =====
 @app.get("/health")
 def health_check():
     """Health check endpoint"""
     return {
         "status": "healthy",
         "device": device,
+        "models_loaded": global_state.models_loaded,
         "models": {
-            "easyocr_reader": True,
-            "plate_model": True,
-            "container_model": True,
-            "trocr_model": (trocr_processor is not None and trocr_model is not None),
-            "face_classifier": (classifier is not None),
-            "label_encoder": (label_encoder is not None),
+            "yolo_plate": model_manager.yolo_models.get('plate') is not None,
+            "yolo_container": model_manager.yolo_models.get('container') is not None,
+            "mtcnn": model_manager.face_models.get('mtcnn') is not None,
+            "facenet": model_manager.face_models.get('facenet') is not None,
+            "face_classifier": model_manager.face_classifier is not None,
+            "ocr_models": model_manager.ocr_models is not None,
         }
     }
 
@@ -686,8 +1038,8 @@ async def websocket_flutter_metadata(websocket: WebSocket):
     try:
         last_metadata = None
         while True:
-            with frame_lock:
-                current_metadata = latest_metadata.copy()
+            with global_state.frame_lock:
+                current_metadata = global_state.latest_metadata.copy()  # Sửa ở đây
             
             # Only send if metadata has changed
             if current_metadata != last_metadata:
@@ -700,15 +1052,3 @@ async def websocket_flutter_metadata(websocket: WebSocket):
         print("[Flutter WebSocket] Client disconnected")
     except Exception as e:
         print(f"[Flutter WebSocket Error] {e}")
-
-# ===== MAIN ENTRY POINT =====
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(
-        app, 
-        host="0.0.0.0", 
-        port=8000,
-        ws_ping_interval=PING_INTERVAL,
-        ws_ping_timeout=PING_TIMEOUT
-    )
-

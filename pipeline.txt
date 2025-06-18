@@ -19,20 +19,20 @@
 * Thứ tự chạy:  Chạy server API --> chạy client-camera --> chạy Frontend
 
 * Task: 
-_ Viết hàm đánh giá độ chính xác
-_ Lấy dữ liệu ảnh từ folder, dữ liệu > 1000 ảnh 
-_ Lưu kết quả đánh giá ra file csv, so sánh kết quả AI vs kết quả thực tế
+_ Viết hàm đánh giá độ chính xác ✔
+_ Lấy dữ liệu ảnh từ folder, dữ liệu > 1000 ảnh ✔
+_ Lưu kết quả đánh giá ra file csv, so sánh kết quả AI vs kết quả thực tế ✔
     + 1: Trùng kết quả
     + 0: Sai kết quả
 _ Cải tiến độ nhận diện AI 
-_ Dữ liệu file csv:
-    + Tên ảnh
-    + Loại model detect
-    + Kết quả AI 
-    + Kết quả thực tế 
-    + Thời gian trả kết quả /\ Tổng thời gian trả kết quả
-    + Thống kê số lượng ảnh chính xác/tổng số lượng ảnh /\ xác suất chính xác
-    + Thống kê số lượng ảnh thất bại /\ liệt kê các trường hợp khiến ảnh thất bại
+_ Dữ liệu file csv: ✘
+    + Tên ảnh  ✔
+    + Loại model detect ✔
+    + Kết quả AI ✔
+    + Kết quả thực tế ✔
+    + Thời gian trả kết quả ✔ /\ Tổng thời gian trả kết quả
+    + Thống kê số lượng ảnh chính xác/tổng số lượng ảnh /\ xác suất chính xác ✔
+    + Thống kê số lượng ảnh thất bại ✔/\ liệt kê các trường hợp khiến ảnh thất bại ✘
 
     
 * Tiêu chí đánh giá:
