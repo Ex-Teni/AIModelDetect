@@ -26,7 +26,7 @@ from PIL import Image
 from starlette.websockets import WebSocketDisconnect
 from typing import List, Dict, Any, Optional, Tuple
 from contextlib import asynccontextmanager
-
+from dataclasses import dataclass
 
 # ===== GLOBAL VARIABLES =====
 app = FastAPI()
@@ -154,6 +154,14 @@ class OCRModels:
         self.plate_config = r'--oem 3 --psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'
         self.container_config = r'--oem 3 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
 
+@dataclass
+class PlateResult:
+    text: str
+    confidence: float
+    method: str
+    is_multiline: bool
+
+
 # ===== UTILITY FUNCTIONS =====
 def decode_base64_to_image(b64: str) -> Optional[np.ndarray]:
     """Decode base64 string to OpenCV image"""
@@ -236,33 +244,6 @@ def remove_duplicate_detections(detections):
     return filtered
 
 # ===== TEXT PROCESSING FUNCTIONS =====
-def detect_text_orientation(image: np.ndarray) -> str:
-    """Phát hiện hướng của text (horizontal/vertical)"""
-    try:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
-        edges = cv2.Canny(gray, 50, 150, apertureSize=3)
-        lines = cv2.HoughLines(edges, 1, np.pi/180, threshold=20)
-        
-        if lines is None:
-            return "horizontal"
-        
-        horizontal_count = 0
-        vertical_count = 0
-
-        for line in lines:
-            rho, theta = line[0]
-            angle = theta * 180 / np.pi
-
-            if angle < 10 or angle > 170:
-                horizontal_count += 1
-            elif 80 < angle < 100:
-                vertical_count += 1
-        
-        return "vertical" if vertical_count > horizontal_count else "horizontal"
-    except Exception as e:
-        print(f"[FAILED] Text orientation detection failed: {e}")
-        return "horizontal"
-
 def preprocess_image_for_ocr(image):
     """Preprocess image to improve OCR accuracy"""
     # Convert to grayscale if needed
@@ -305,27 +286,78 @@ def preprocess_image_for_ocr(image):
     rgb_image = cv2.cvtColor(best_image, cv2.COLOR_GRAY2RGB)
     return rgb_image
 
-def preprocess_for_multiline_text(image):
-    """Tiền xử lý ảnh cho văn bản nhiều dòng"""
-    
-    # Convert to grayscale if needed
-    if len(image.shape) == 3:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = image.copy()
-    
-    # Method 1: Denoising + CLAHE
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(gray)
+def detect_text_orientation(image: np.ndarray) -> str:
+    """Phát hiện hướng của text (horizontal/vertical)"""
+    try:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+        edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+        lines = cv2.HoughLines(edges, 1, np.pi/180, threshold=20)
+        
+        if lines is None:
+            return "horizontal"
+        
+        horizontal_count = 0
+        vertical_count = 0
 
-    # Noise reduction
-    denoised = cv2.fastNlMeansDenoising(enhanced, None, 10, 7, 21)
+        for line in lines:
+            rho, theta = line[0]
+            angle = theta * 180 / np.pi
 
-    # Morphological operations to connect text
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 1))
-    morph = cv2.morphologyEx(denoised, cv2.MORPH_CLOSE, kernel)
+            if angle < 10 or angle > 170:
+                horizontal_count += 1
+            elif 80 < angle < 100:
+                vertical_count += 1
+        
+        return "vertical" if vertical_count > horizontal_count else "horizontal"
+    except Exception as e:
+        print(f"[FAILED] Text orientation detection failed: {e}")
+        return "horizontal"
+
+def preprocess_for_multiline_text(image: np.ndarray) -> List[np.ndarray]:
+    """Tiền xử lý chuyên biệt cho biển số xe 2 dòng"""
+    processed_variants = []
     
-    return morph
+    try:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+        h, w = gray.shape
+        
+        # Resize nếu quá nhỏ
+        if h < 80 or w < 200:
+            scale = max(80/h, 200/w, 1.5)
+            gray = cv2.resize(gray, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_CUBIC)
+            h, w = gray.shape
+        
+        # Variant 1: CLAHE + Gaussian blur
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        enhanced = clahe.apply(gray)
+        gaussian = cv2.GaussianBlur(enhanced, (3,3), 0)
+        processed_variants.append(gaussian)
+        
+        # Variant 2: Denoising + Sharpening
+        denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+        kernel_sharp = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+        sharpened = cv2.filter2D(denoised, -1, kernel_sharp)
+        processed_variants.append(sharpened)
+        
+        # Variant 3: Morphological operations for text connection
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 1))
+        morph_close = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel_close)
+        processed_variants.append(morph_close)
+        
+        # Variant 4: Adaptive threshold
+        adaptive = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                       cv2.THRESH_BINARY, 11, 2)
+        processed_variants.append(adaptive)
+        
+        # Variant 5: OTSU threshold
+        _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        processed_variants.append(otsu)
+        
+        return processed_variants
+        
+    except Exception as e:
+        print(f"[ERROR] Preprocessing failed: {e}")
+        return [gray] if 'gray' in locals() else []
 
 def preprocess_for_vertical_text(image):
     """Tiền xử lý hình ảnh cho văn bản đọc"""
@@ -352,7 +384,145 @@ def preprocess_for_vertical_text(image):
     
     return morph
 
+def detect_plate_layout(image: np.ndarray) -> Dict[str, any]: # type: ignore
+    """Phát hiện layout của biển số xe (1 dòng hay 2 dòng)"""
+    try:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+        
+        # Tìm contours để phát hiện text regions
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        
+        # Morphological operations để kết nối các ký tự
+        kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
+        connected = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel_h)
+        
+        # Tìm contours của các dòng text
+        contours, _ = cv2.findContours(connected, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Lọc contours theo kích thước
+        text_regions = []
+        h, w = gray.shape
+        min_area = (w * h) * 0.02  # Tối thiểu 2% diện tích
+        
+        for contour in contours:
+            x, y, w_c, h_c = cv2.boundingRect(contour)
+            area = w_c * h_c
+            
+            if area > min_area and w_c > 30 and h_c > 10:
+                text_regions.append({
+                    'bbox': (x, y, x + w_c, y + h_c),
+                    'area': area,
+                    'center_y': y + h_c // 2
+                })
+        
+        # Sắp xếp theo vị trí Y
+        text_regions.sort(key=lambda x: x['center_y'])
+        
+        # Phân tích layout
+        is_multiline = len(text_regions) >= 2
+        aspect_ratio = w / h if h > 0 else 1
+        
+        return {
+            'is_multiline': is_multiline,
+            'text_regions': text_regions,
+            'aspect_ratio': aspect_ratio,
+            'num_regions': len(text_regions)
+        }
+        
+    except Exception as e:
+        print(f"[ERROR] Layout detection failed: {e}")
+        return {'is_multiline': False, 'text_regions': [], 'aspect_ratio': 1, 'num_regions': 0}
+    
 
+def extract_text_regions_separately(image: np.ndarray, layout_info: Dict) -> List[Tuple[np.ndarray, str]]:
+    """Tách các vùng text riêng biệt để OCR"""
+    text_crops = []
+    
+    try:
+        if not layout_info['is_multiline'] or not layout_info['text_regions']:
+            return [(image, "single_line")]
+        
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+        
+        for i, region in enumerate(layout_info['text_regions']):
+            x1, y1, x2, y2 = region['bbox']
+            
+            # Thêm padding nhỏ
+            padding = 3
+            x1 = max(0, x1 - padding)
+            y1 = max(0, y1 - padding)
+            x2 = min(gray.shape[1], x2 + padding)
+            y2 = min(gray.shape[0], y2 + padding)
+            
+            if x2 > x1 and y2 > y1:
+                crop = gray[y1:y2, x1:x2]
+                text_crops.append((crop, f"line_{i+1}"))
+        
+        return text_crops
+        
+    except Exception as e:
+        print(f"[ERROR] Text region extraction failed: {e}")
+        return [(image, "single_line")]
+    
+
+def clean_plate_text(text: str, is_multiline: bool = False) -> Optional[str]:
+    """Cải tiến text cleaning cho biển số xe"""
+    if not text:
+        return None
+    
+    # Loại bỏ ký tự đặc biệt và chuẩn hóa
+    text = re.sub(r'[^\w\s\-\.]', '', text.upper().strip())
+    
+    # Sửa lỗi OCR
+    ocr_corrections = {
+        'O': '0', 'I': '1', 'l': '1', '|': '1',
+        'S': '5', 'Z': '2', 'G': '6', 'B': '8',
+        'Q': '0', 'D': '0'
+    }
+    
+    for wrong, correct in ocr_corrections.items():
+        text = text.replace(wrong, correct)
+    
+    if is_multiline:
+        # Xử lý biển số 2 dòng
+        lines = [line.strip() for line in text.split('\n') if line.strip()]
+        
+        if len(lines) >= 2:
+            # Ghép các dòng với dấu gạch ngang
+            line1 = re.sub(r'[^A-Z0-9]', '', lines[0])
+            line2 = re.sub(r'[^A-Z0-9]', '', lines[1])
+            
+            if line1 and line2:
+                combined = f"{line1}-{line2}"
+                if len(combined) >= 4:
+                    return combined
+        
+        # Fallback: ghép tất cả thành 1 chuỗi
+        combined = ''.join(re.sub(r'[^A-Z0-9]', '', line) for line in lines)
+        if len(combined) >= 4:
+            return combined
+    
+    else:
+        # Xử lý biển số 1 dòng
+        cleaned = re.sub(r'[^A-Z0-9\-]', '', text)
+        if len(cleaned) >= 2:
+            return cleaned
+    
+    return None
+
+def clean_container_text(text: str) -> Optional[str]:
+    """Xử lý text container code dọc"""
+    # Container format: 4 letters + 7 digits (e.g., ABCD1234567)
+    text = re.sub(r'[^A-Z0-9]', '', text.upper().strip())
+    
+    # Common OCR corrections
+    text = text.replace('O', '0').replace('I', '1').replace('S', '5')
+    
+    # Validate container format (at least 4 characters)
+    if len(text) >= 4:
+        return text
+    
+    return None
 def clean_text(text: str, text_type: str) -> Optional[str]:
     """Clean and validate OCR text based on type"""
     if not text:
@@ -383,49 +553,6 @@ def clean_text(text: str, text_type: str) -> Optional[str]:
     
     return text if text else None
 
-def clean_plate_text(text: str) -> Optional[str]:
-    """Xử lý text biển số xe 2 dòng"""
-    if not text:
-        return None
-    
-    # Xoá các ký tự đặc biệt
-    text = re.sub(r'[^\w\s\-]', '', text.upper())
-
-    # Biển số xe nhiều dòng
-    lines = [line.strip() for line in text.split('\n') if line.strip()]
-    if len(lines) > 1:
-        # GHép nhiều dòng lại thành 1
-        combined = ''.join(re.sub(r'[^A-Z0-9\-]', '', line) for line in lines)
-        if len(combined) >= 4:
-            return combined
-        
-        # Tách ký tự bằng dấu gạch ngang
-        separated = '-'.join(re.sub(r'[^A-Z0-9]', '', line) for line in lines if re.sub(r'[^A-Z0-9]', '', line))
-        if len(separated) >= 4:
-            return separated
-        
-    else:
-        # Biển số 1 dòng
-        cleaned = re.sub(r'[^A-Z0-9\-]', '', text)
-        if len(cleaned) >= 2:
-            return cleaned
-    
-    return None
-
-def clean_container_text(text: str) -> Optional[str]:
-    """Xử lý text container code dọc"""
-    # Container format: 4 letters + 7 digits (e.g., ABCD1234567)
-    text = re.sub(r'[^A-Z0-9]', '', text.upper().strip())
-    
-    # Common OCR corrections
-    text = text.replace('O', '0').replace('I', '1').replace('S', '5')
-    
-    # Validate container format (at least 4 characters)
-    if len(text) >= 4:
-        return text
-    
-    return None
-
 # ===== OCR FUNCTIONS =====
 @timeout_with_executor(OCR_TIMEOUT)
 def extract_text_with_easyocr_fast(image_crop: np.ndarray, text_type: str = "plate") -> Tuple[Optional[str], float]:
@@ -454,104 +581,191 @@ def extract_text_with_easyocr_fast(image_crop: np.ndarray, text_type: str = "pla
         return None, 0.0
 
 @timeout_with_executor(OCR_TIMEOUT)
-def extract_text_plate(image_crop: np.ndarray, ocr_models: OCRModels) -> Tuple[Optional[str], float]:
-    """Enhanced OCR for license plates with multi-line support"""
-    results = []
+def extract_text_plate(image_crop: np.ndarray, ocr_models) -> Tuple[Optional[str], float]:
+    """Cải tiến OCR cho biển số xe 2 dòng"""
+    all_results = []
     
     try:
-        # Preprocessing for license plates
-        processed_images = []
+        # 1. Phát hiện layout
+        layout_info = detect_plate_layout(image_crop)
+        is_multiline = layout_info['is_multiline']
         
-        gray = cv2.cvtColor(image_crop, cv2.COLOR_BGR2GRAY) if len(image_crop.shape) == 3 else image_crop
+        print(f"[INFO] Detected layout: {'Multiline' if is_multiline else 'Single line'}")
         
-        # Resize if too small
-        h, w = gray.shape
-        if h < 64 or w < 200:
-            scale = max(64/h, 200/w, 2.0)
-            gray = cv2.resize(gray, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_CUBIC)
+        # 2. Tiền xử lý chuyên biệt
+        processed_variants = preprocess_for_multiline_text(image_crop)
         
-        # Multiple preprocessing methods
-        # Method 1: CLAHE + Denoising
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
-        enhanced = clahe.apply(gray)
-        denoised = cv2.fastNlMeansDenoising(enhanced, None, 10, 7, 21)
-        processed_images.append(denoised)
+        # 3. Tách vùng text nếu là multiline
+        if is_multiline:
+            text_regions = extract_text_regions_separately(image_crop, layout_info)
+        else:
+            text_regions = [(image_crop, "single_line")]
         
-        # Method 2: Morphological operations
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3,1))
-        morph = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
-        processed_images.append(morph)
-        
-        # Method 3: Gaussian + Threshold
-        blurred = cv2.GaussianBlur(gray, (3,3), 0)
-        _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        processed_images.append(thresh)
-        
-        # ===== OCR METHODS =====
-        
-        # 1. PaddleOCR
-        if ocr_models.paddle_ocr is not None:
-            for i, processed in enumerate(processed_images):
+        # 4. OCR với nhiều phương pháp
+        for variant_idx, processed_img in enumerate(processed_variants):
+            
+            # Method 1: PaddleOCR
+            if hasattr(ocr_models, 'paddle_ocr') and ocr_models.paddle_ocr is not None:
                 try:
-                    paddle_results = ocr_models.paddle_ocr.ocr(processed, cls=True)
+                    paddle_results = ocr_models.paddle_ocr.ocr(processed_img, cls=True)
                     if paddle_results and paddle_results[0]:
-                        for line in paddle_results[0]:
-                            text = line[1][0]
-                            conf = line[1][1]
-                            cleaned = clean_plate_text(text)
-                            if cleaned and conf > 0.7:
-                                results.append((cleaned, conf, f"PaddleOCR_{i}"))
-                except Exception as e:
-                    print(f"[ERROR] PaddleOCR method {i} failed: {e}")
-        
-        # 2. EasyOCR
-        if ocr_models.easy_ocr is not None:
-            for i, processed in enumerate(processed_images):
-                try:
-                    easy_results = ocr_models.easy_ocr.readtext(
-                        processed, 
-                        allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-',
-                        width_ths=0.7, height_ths=0.7
-                    )
-                    if easy_results:
-                        best_result = max(easy_results, key=lambda x: x[2]) # type: ignore
-                        text, conf = best_result[1], best_result[2] # type: ignore
-                        cleaned = clean_plate_text(text)
-                        if cleaned and conf > 0.6: # type: ignore
-                            results.append((cleaned, conf, f"EasyOCR_{i}"))
+                        if is_multiline:
+                            # Xử lý nhiều dòng
+                            lines = []
+                            for line in paddle_results[0]:
+                                lines.append(line[1][0])
+                            text = '\n'.join(lines)
+                        else:
+                            text = paddle_results[0][0][1][0]
+                        
+                        conf = paddle_results[0][0][1][1]
+                        cleaned = clean_plate_text(text, is_multiline)
+                        
+                        if cleaned and conf > 0.7:
+                            all_results.append(PlateResult(
+                                text=cleaned,
+                                confidence=conf,
+                                method=f"PaddleOCR_v{variant_idx}",
+                                is_multiline=is_multiline
+                            ))
                             
                 except Exception as e:
-                    print(f"[ERROR] EasyOCR method {i} failed: {e}")
-        
-        # 3. Tesseract
-        for i, processed in enumerate(processed_images):
-            try:
-                text = pytesseract.image_to_string(processed, config=ocr_models.plate_config).strip()
-                if text:
-                    cleaned = clean_plate_text(text)
-                    if cleaned:
-                        results.append((cleaned, 0.7, f"Tesseract_{i}"))
-            except Exception as e:
-                print(f"[ERROR] Tesseract method {i} failed: {e}")
-        
-        # Choose best result
-        if results:
-            priority_order = ['PaddleOCR', 'EasyOCR', 'Tesseract']
+                    print(f"[ERROR] PaddleOCR variant {variant_idx} failed: {e}")
             
-            def get_priority(method_name):
-                for i, priority in enumerate(priority_order):
+            # Method 2: EasyOCR với cấu hình multiline
+            if hasattr(ocr_models, 'easy_ocr') and ocr_models.easy_ocr is not None:
+                try:
+                    easy_results = ocr_models.easy_ocr.readtext(
+                        processed_img,
+                        allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-',
+                        width_ths=0.7,
+                        height_ths=0.4 if is_multiline else 0.7,
+                        paragraph=is_multiline
+                    )
+                    
+                    if easy_results:
+                        if is_multiline and len(easy_results) > 1:
+                            # Sắp xếp theo vị trí Y
+                            easy_results.sort(key=lambda x: x[0][0][1])
+                            texts = [result[1] for result in easy_results]
+                            text = '\n'.join(texts)
+                            conf = sum([result[2] for result in easy_results]) / len(easy_results)
+                        else:
+                            best_result = max(easy_results, key=lambda x: x[2])
+                            text = best_result[1]
+                            conf = best_result[2]
+                        
+                        cleaned = clean_plate_text(text, is_multiline)
+                        
+                        if cleaned and conf > 0.6:
+                            all_results.append(PlateResult(
+                                text=cleaned,
+                                confidence=conf,
+                                method=f"EasyOCR_v{variant_idx}",
+                                is_multiline=is_multiline
+                            ))
+                            
+                except Exception as e:
+                    print(f"[ERROR] EasyOCR variant {variant_idx} failed: {e}")
+            
+            # Method 3: Tesseract với PSM phù hợp
+            try:
+                if is_multiline:
+                    # PSM 6 cho text blocks
+                    config = r'--oem 3 --psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'
+                else:
+                    # PSM 8 cho single line
+                    config = r'--oem 3 --psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'
+                
+                text = pytesseract.image_to_string(processed_img, config=config).strip()
+                
+                if text:
+                    cleaned = clean_plate_text(text, is_multiline)
+                    if cleaned:
+                        all_results.append(PlateResult(
+                            text=cleaned,
+                            confidence=0.75,
+                            method=f"Tesseract_v{variant_idx}",
+                            is_multiline=is_multiline
+                        ))
+                        
+            except Exception as e:
+                print(f"[ERROR] Tesseract variant {variant_idx} failed: {e}")
+        
+        # 5. Xử lý riêng từng vùng text nếu là multiline
+        if is_multiline and len(text_regions) > 1:
+            region_texts = []
+            region_confidences = []
+            
+            for region_img, region_name in text_regions:
+                best_region_result = None
+                best_region_conf = 0
+                
+                # OCR từng vùng
+                for processed_img in processed_variants[:3]:  # Chỉ dùng 3 variant tốt nhất
+                    
+                    # EasyOCR cho từng vùng
+                    try:
+                        easy_results = ocr_models.easy_ocr.readtext(
+                            region_img,
+                            allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+                            width_ths=0.8,
+                            height_ths=0.8
+                        )
+                        
+                        if easy_results:
+                            best_result = max(easy_results, key=lambda x: x[2])
+                            text = best_result[1]
+                            conf = best_result[2]
+                            
+                            if conf > best_region_conf:
+                                best_region_result = text
+                                best_region_conf = conf
+                                
+                    except Exception as e:
+                        print(f"[ERROR] Region OCR failed: {e}")
+                
+                if best_region_result:
+                    cleaned_region = re.sub(r'[^A-Z0-9]', '', best_region_result.upper())
+                    if cleaned_region:
+                        region_texts.append(cleaned_region)
+                        region_confidences.append(best_region_conf)
+            
+            # Ghép các vùng lại
+            if len(region_texts) >= 2:
+                combined_text = '-'.join(region_texts)
+                avg_conf = sum(region_confidences) / len(region_confidences)
+                
+                all_results.append(PlateResult(
+                    text=combined_text,
+                    confidence=avg_conf,
+                    method="RegionBased_OCR",
+                    is_multiline=True
+                ))
+        
+        # 6. Chọn kết quả tốt nhất
+        if all_results:
+            # Ưu tiên theo method và confidence
+            priority_methods = ['PaddleOCR', 'RegionBased', 'EasyOCR', 'Tesseract']
+            
+            def get_method_priority(method_name):
+                for i, priority in enumerate(priority_methods):
                     if priority in method_name:
                         return i
-                return len(priority_order)
+                return len(priority_methods)
             
-            results.sort(key=lambda x: (-x[1], get_priority(x[2])))
-            best_result = results[0]
-            return best_result[0], best_result[1]
+            # Sắp xếp theo confidence và method priority
+            all_results.sort(key=lambda x: (-x.confidence, get_method_priority(x.method)))
+            
+            best_result = all_results[0]
+            print(f"[SUCCESS] Best result: {best_result.text} (conf: {best_result.confidence:.3f}, method: {best_result.method})")
+            
+            return best_result.text, best_result.confidence
         
         return None, 0.0
         
     except Exception as e:
-        print(f"[FAILED] Enhanced plate OCR failed: {e}")
+        print(f"[FAILED] Enhanced multiline plate OCR failed: {e}")
         return None, 0.0
 
 @timeout_with_executor(OCR_TIMEOUT)
@@ -679,8 +893,8 @@ def detect_plates(frame: np.ndarray) -> List[Dict]:
             conf = float(box.conf[0])
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             
-            # Add low confidence detections without OCR
-            if conf < 0.15:
+            # Bỏ qua detection confidence quá thấp
+            if conf < 0.12:
                 results.append({
                     "type": "plate",
                     "box": [x1, y1, x2, y2],
@@ -689,9 +903,9 @@ def detect_plates(frame: np.ndarray) -> List[Dict]:
                 })
                 continue
 
-            # Crop with minimal padding
+            # Crop với padding phù hợp
             h, w = frame.shape[:2]
-            padding = 5
+            padding = 8  # Tăng padding để capture đầy đủ text
             x1_c = max(0, x1 - padding)
             y1_c = max(0, y1 - padding)
             x2_c = min(w, x2 + padding)
@@ -702,18 +916,20 @@ def detect_plates(frame: np.ndarray) -> List[Dict]:
                 
             cropped = frame[y1_c:y2_c, x1_c:x2_c]
 
-            # Try TrOCR first, then EasyOCR as fallback
-            text, ocr_conf = extract_text_plate(cropped, model_manager.ocr_models) # type: ignore
+            # Sử dụng OCR cải tiến
+            text, ocr_conf = extract_text_plate(cropped, model_manager.ocr_models)
             
             results.append({
                 "type": "plate",
                 "box": [x1, y1, x2, y2],
                 "text": text,
-                "confidence": ocr_conf if text else conf
+                "confidence": ocr_conf if text else conf,
+                "detection_confidence": conf,
+                "ocr_confidence": ocr_conf if text else 0.0
             })
     
     except Exception as e:
-        print(f"[FAILED] Plate detection failed: {e}")
+        print(f"[FAILED] Enhanced plate detection failed: {e}")
     
     return results
 
@@ -771,6 +987,7 @@ def detect_faces(frame):
     results = []
     try:
         img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mtcnn = model_manager.face_models['mtcnn']
         boxes, probs = mtcnn.detect(img_rgb) # type: ignore
 
         if boxes is None or len(boxes) == 0:
