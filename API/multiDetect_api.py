@@ -1,6 +1,6 @@
-import asyncio
 import subprocess
 import time
+import uuid
 import cv2
 import torch
 import json
@@ -12,6 +12,8 @@ import easyocr
 import threading
 import pytesseract
 import concurrent.futures
+from logging import debug
+from fastapi import Request
 from paddleocr import PaddleOCR
 from transformers import TrOCRProcessor, VisionEncoderDecoderModel
 from fastapi import FastAPI, WebSocket, HTTPException
@@ -31,6 +33,8 @@ from dataclasses import dataclass
 # ===== GLOBAL VARIABLES =====
 app = FastAPI()
 device = "cuda" if torch.cuda.is_available() else "cpu"
+mtcnn = MTCNN(keep_all=True, device=device)
+
 print(f"Using device: {device}")
 
 class GlobalState:
@@ -43,16 +47,16 @@ class GlobalState:
 # Detection thresholds
 FACE_CONFIDENCE_THRESHOLD = 0.95  # Face detection threshold
 OCR_CONFIDENCE_THRESHOLD = 0.3    # OCR confidence threshold
-SEAL_OCR_CONFIDENCE_THRESHOLD = 0.25  # Lower threshold for seal detection
+SEAL_OCR_CONFIDENCE_THRESHOLD = 0.25  # Threshold for seal detection
 
 # WebSocket timeout settings
-WEBSOCKET_TIMEOUT = 30  # seconds
+WEBSOCKET_TIMEOUT = 60  # seconds
 PING_INTERVAL = 10      # seconds
 PING_TIMEOUT = 5        # seconds
 
 # Processing timeout settings
-IMAGE_PROCESSING_TIMEOUT = 25  # seconds (less than WebSocket timeout)
-OCR_TIMEOUT = 5  # seconds per OCR operation
+IMAGE_PROCESSING_TIMEOUT = 45  # seconds 
+OCR_TIMEOUT = 60  # seconds per OCR operation
 
 # ===== CORS MIDDLEWARE =====
 app.add_middleware(
@@ -131,9 +135,9 @@ class OCRModels:
             self.paddle_ocr = PaddleOCR(
                 use_angle_cls=True,
                 lang="en",
-                # Removed show_log parameter as it's not supported
             )
             print("[INFO] PaddleOCR initialized successfully")
+
         except Exception as e:
             print(f"[ERROR] PaddleOCR initialization failed: {e}")
             self.paddle_ocr = None
@@ -145,12 +149,14 @@ class OCRModels:
             self.trocr_processor = TrOCRProcessor.from_pretrained("microsoft/trocr-base-printed")
             self.trocr_model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-base-printed")
             print("[INFO] TrOCR models loaded successfully")
+            
         except Exception as e:
             self.trocr_processor = None
             self.trocr_model = None
             print(f"[WARNING] TrOCR models failed to load: {e}")
 
         # Tesseract config
+        self.tesseract_cmd = r"C:\Tesseract-OCR\tesseract.exe"
         self.plate_config = r'--oem 3 --psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'
         self.container_config = r'--oem 3 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
 
@@ -161,233 +167,146 @@ class PlateResult:
     method: str
     is_multiline: bool
 
+@dataclass
+class ContainerResult:
+    text: str
+    confidence: float
+    method: str
 
 # ===== UTILITY FUNCTIONS =====
-def decode_base64_to_image(b64: str) -> Optional[np.ndarray]:
-    """Decode base64 string to OpenCV image"""
-    try:
-        img_data = base64.b64decode(b64)
-        arr = np.frombuffer(img_data, np.uint8)
-        return cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    except Exception as e:
-        print(f"[ERROR] Base64 decode failed: {e}")
-        return None
-
-def encode_image_to_base64(img: np.ndarray) -> str:
-    """Encode OpenCV image to base64 string"""
-    _, buff = cv2.imencode(".jpg", img)
-    return base64.b64encode(buff).decode("utf-8") # type: ignore
-
-def timeout_with_executor(timeout_seconds: float):
-    """Windows-compatible timeout decorator using ThreadPoolExecutor"""
+global_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+def timeout_with_executor(timeout_sec: float):
     def decorator(func):
-        @wraps(func)
         def wrapper(*args, **kwargs):
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                try:
-                    future = executor.submit(func, *args, **kwargs)
-                    result = future.result(timeout=timeout_seconds)
-                    return result
-                except concurrent.futures.TimeoutError:
-                    print(f"[TIMEOUT] {func.__name__} timed out after {timeout_seconds}s")
-                    return None, 0.0 if func.__name__.startswith('extract_text') else None
-                except Exception as e:
-                    print(f"[ERROR] {func.__name__} failed: {e}")
-                    return None, 0.0 if func.__name__.startswith('extract_text') else None
+            future = global_executor.submit(func, *args, **kwargs)
+            try:
+                return future.result(timeout=timeout_sec)
+            except concurrent.futures.TimeoutError:
+                print(f"[TIMEOUT] {func.__name__} timed out after {timeout_sec}s")
+                return None
         return wrapper
     return decorator
 
-def boxes_overlap(box1, box2, threshold=0.3):
-    """Check if two bounding boxes overlap above threshold"""
-    x1_1, y1_1, x2_1, y2_1 = box1
-    x1_2, y1_2, x2_2, y2_2 = box2
-    
-    # Calculate intersection
-    x_left = max(x1_1, x1_2)
-    y_top = max(y1_1, y1_2)
-    x_right = min(x2_1, x2_2)
-    y_bottom = min(y2_1, y2_2)
-    
-    if x_right < x_left or y_bottom < y_top:
-        return False
-    
-    intersection_area = (x_right - x_left) * (y_bottom - y_top)
-    box1_area = (x2_1 - x1_1) * (y2_1 - y1_1)
-    box2_area = (x2_2 - x1_2) * (y2_2 - y1_2)
-    
-    if min(box1_area, box2_area) <= 0:
-        return False
-    
-    overlap_ratio = intersection_area / min(box1_area, box2_area)
-    return overlap_ratio > threshold
-
-def remove_duplicate_detections(detections):
-    """Remove duplicate and overlapping detections"""
-    if not detections:
-        return []
-    
-    # Sort by confidence (highest first)
-    detections.sort(key=lambda x: x['confidence'], reverse=True)
-    
-    filtered = []
-    for det in detections:
-        is_duplicate = False
-        for existing in filtered:
-            # Check if boxes overlap significantly
-            if boxes_overlap(det['box'], existing['box'], threshold=0.5):
-                is_duplicate = True
-                break
-        
-        if not is_duplicate:
-            filtered.append(det)
-    
-    return filtered
-
 # ===== TEXT PROCESSING FUNCTIONS =====
-def preprocess_image_for_ocr(image):
-    """Preprocess image to improve OCR accuracy"""
-    # Convert to grayscale if needed
-    if len(image.shape) == 3:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = image.copy()
-    
-    # Resize if too small
-    height, width = gray.shape
-    if height < 64 or width < 200:
-        scale = max(64 / height, 200 / width, 2.0)
-        new_height = int(height * scale)
-        new_width = int(width * scale)
-        gray = cv2.resize(gray, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
-    
-    # Apply multiple preprocessing methods and choose the best
-    processed_images = []
-    
-    # Method 1: Denoising + CLAHE
-    denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(denoised)
-    processed_images.append(enhanced)
-    
-    # Method 2: Gaussian blur + OTSU threshold
-    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    processed_images.append(thresh)
-
-    # Method 3: Morphological operations
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-    morph = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
-    processed_images.append(morph)
-    
-    # Use the first processed image (can be enhanced with quality assessment)
-    best_image = processed_images[0]
-    
-    # Convert to RGB for TrOCR
-    rgb_image = cv2.cvtColor(best_image, cv2.COLOR_GRAY2RGB)
-    return rgb_image
-
 def detect_text_orientation(image: np.ndarray) -> str:
     """Phát hiện hướng của text (horizontal/vertical)"""
     try:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
-        edges = cv2.Canny(gray, 50, 150, apertureSize=3)
-        lines = cv2.HoughLines(edges, 1, np.pi/180, threshold=20)
+        h, w = gray.shape
         
-        if lines is None:
+        # Tính gradient theo các hướng
+        grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        
+        # Tính độ mạnh gradient
+        grad_x_strength = np.sum(np.abs(grad_x))
+        grad_y_strength = np.sum(np.abs(grad_y))
+        
+        # Phân tích tỷ lệ khung hình
+        aspect_ratio = w / h
+        
+        if aspect_ratio > 2.5:  
             return "horizontal"
-        
-        horizontal_count = 0
-        vertical_count = 0
-
-        for line in lines:
-            rho, theta = line[0]
-            angle = theta * 180 / np.pi
-
-            if angle < 10 or angle > 170:
-                horizontal_count += 1
-            elif 80 < angle < 100:
-                vertical_count += 1
-        
-        return "vertical" if vertical_count > horizontal_count else "horizontal"
+        elif aspect_ratio < 0.5: 
+            return "vertical"
+        else:
+            # Dựa vào gradient
+            if grad_x_strength > grad_y_strength * 1.2:
+                return "vertical"
+            elif grad_y_strength > grad_x_strength * 1.5:
+                return "horizontal"
+            else:
+                # Fallback dựa vào aspect ratio
+                return "horizontal" if aspect_ratio > 1.0 else "vertical"
+                
     except Exception as e:
-        print(f"[FAILED] Text orientation detection failed: {e}")
+        print(f"[WARN] Orientation detection failed: {e}")
         return "horizontal"
 
-def preprocess_for_multiline_text(image: np.ndarray) -> List[np.ndarray]:
-    """Tiền xử lý chuyên biệt cho biển số xe 2 dòng"""
+# ===== PREPROCESS IMAGE FOR OCR FUNCTIONS =====
+def preprocess_for_plate_text(image: np.ndarray) -> List[np.ndarray]:
+    """Tiền xử lý cho biển số xe 2 dòng"""
     processed_variants = []
-    
     try:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
         h, w = gray.shape
         
-        # Resize nếu quá nhỏ
-        if h < 80 or w < 200:
-            scale = max(80/h, 200/w, 1.5)
-            gray = cv2.resize(gray, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_CUBIC)
-            h, w = gray.shape
-        
-        # Variant 1: CLAHE + Gaussian blur
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        # 1. Thiếu sáng: CLAHE + Sharpen
+        clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 4))
         enhanced = clahe.apply(gray)
-        gaussian = cv2.GaussianBlur(enhanced, (3,3), 0)
-        processed_variants.append(gaussian)
-        
-        # Variant 2: Denoising + Sharpening
-        denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
-        kernel_sharp = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
-        sharpened = cv2.filter2D(denoised, -1, kernel_sharp)
+        kernel_sharp = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]])
+        sharpened = cv2.filter2D(enhanced, -1, kernel_sharp)
         processed_variants.append(sharpened)
-        
-        # Variant 3: Morphological operations for text connection
-        kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 1))
-        morph_close = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel_close)
-        processed_variants.append(morph_close)
-        
-        # Variant 4: Adaptive threshold
-        adaptive = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                       cv2.THRESH_BINARY, 11, 2)
+
+        # 2. Nhiễu: Denoise + Adaptive Threshold
+        denoised = cv2.fastNlMeansDenoising(gray, None, 15, 7, 21)
+        adaptive = cv2.adaptiveThreshold(denoised, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                         cv2.THRESH_BINARY, 21, 10)
         processed_variants.append(adaptive)
-        
-        # Variant 5: OTSU threshold
-        _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        processed_variants.append(otsu)
-        
+
+        # 3. Text mờ: Gradient + Adaptive
+        kernel_grad = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        gradient = cv2.morphologyEx(enhanced, cv2.MORPH_GRADIENT, kernel_grad)
+        adaptive2 = cv2.adaptiveThreshold(gradient, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                          cv2.THRESH_BINARY, 25, 11)
+        processed_variants.append(adaptive2)
+
+        # 4. Rõ nét: CLAHE nhẹ
+        clahe_light = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 2))
+        light_enhanced = clahe_light.apply(gray)
+        processed_variants.append(light_enhanced)
+
         return processed_variants
-        
     except Exception as e:
-        print(f"[ERROR] Preprocessing failed: {e}")
+        print(f"[ERROR] Plate preprocessing failed: {e}")
         return [gray] if 'gray' in locals() else []
 
-def preprocess_for_vertical_text(image):
-    """Tiền xử lý hình ảnh cho văn bản đọc"""
+def preprocess_for_container_text(image: np.ndarray):
+    "Tiền xử lý ảnh cho OCR số container"
     
-    # Convert to grayscale if needed
-    if len(image.shape) == 3:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = image.copy()
-    
-    # Resize if too small
-    h, w = gray.shape
-    if h < 100:
-        scale = 100 / h
-        gray = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
-    
-    # Enhance contrast specifically for vertical text
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(2, 8))
-    enhanced = clahe.apply(gray)
-    
-    # Vertical morphological operations
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))
-    morph = cv2.morphologyEx(enhanced, cv2.MORPH_CLOSE, kernel)
-    
-    return morph
+    processed_variants = []
+    try:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+        h, w = gray.shape
 
+        min_width, min_height = 300, 120  # Tăng kích thước tối thiểu
+        if h < min_height or w < min_width:
+            scale = max(min_width / w, min_height / h, 2.0)
+            gray = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_LANCZOS4)
+            h, w = gray.shape
+
+        # 1. Preprocessing cơ bản - ưu tiên độ tương phản
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 4))
+        enhanced = clahe.apply(gray)
+        processed_variants.append(enhanced)
+
+        # 2. Denoise + Adaptive threshold
+        denoised = cv2.fastNlMeansDenoising(gray, None, 15, 7, 21)
+        adaptive = cv2.adaptiveThreshold(denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                         cv2.THRESH_BINARY, 19, 8)
+        processed_variants.append(adaptive)
+
+        # 3. Morphology để kết nối ký tự
+        kernel_rect = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        morph = cv2.morphologyEx(enhanced, cv2.MORPH_CLOSE, kernel_rect)
+        processed_variants.append(morph)
+
+
+        # 4. Gradient enhancement
+        kernel_grad = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        gradient = cv2.morphologyEx(enhanced, cv2.MORPH_GRADIENT, kernel_grad)
+        processed_variants.append(gradient)
+
+        return processed_variants
+    except Exception as e:
+        print(f"[ERROR] Container preprocessing failed: {e}")
+        return [gray] if 'gray' in locals() else []
+    
 def detect_plate_layout(image: np.ndarray) -> Dict[str, any]: # type: ignore
     """Phát hiện layout của biển số xe (1 dòng hay 2 dòng)"""
     try:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+        h, w = gray.shape
         
         # Tìm contours để phát hiện text regions
         _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
@@ -401,7 +320,6 @@ def detect_plate_layout(image: np.ndarray) -> Dict[str, any]: # type: ignore
         
         # Lọc contours theo kích thước
         text_regions = []
-        h, w = gray.shape
         min_area = (w * h) * 0.02  # Tối thiểu 2% diện tích
         
         for contour in contours:
@@ -412,58 +330,44 @@ def detect_plate_layout(image: np.ndarray) -> Dict[str, any]: # type: ignore
                 text_regions.append({
                     'bbox': (x, y, x + w_c, y + h_c),
                     'area': area,
-                    'center_y': y + h_c // 2
+                    'center_y': y + h_c // 2,
+                    'center_x': x + w_c // 2, 
+                    'width': w_c,
+                    'height': h_c
                 })
         
         # Sắp xếp theo vị trí Y
-        text_regions.sort(key=lambda x: x['center_y'])
+        text_regions.sort(key=lambda x: (x['center_y'], x['center_x']))
         
         # Phân tích layout
         is_multiline = len(text_regions) >= 2
         aspect_ratio = w / h if h > 0 else 1
         
+        reading_direction = "left_to_right"
+        if text_regions:
+            # Kiểm tra xem có text regions nào bị đảo ngược không
+            sorted_by_x = sorted(text_regions, key=lambda x: x['center_x'])
+            if sorted_by_x != text_regions:
+                reading_direction = "mixed"
+
         return {
             'is_multiline': is_multiline,
             'text_regions': text_regions,
             'aspect_ratio': aspect_ratio,
-            'num_regions': len(text_regions)
+            'num_regions': len(text_regions),
+            'reading_direction': reading_direction
         }
+
         
     except Exception as e:
         print(f"[ERROR] Layout detection failed: {e}")
-        return {'is_multiline': False, 'text_regions': [], 'aspect_ratio': 1, 'num_regions': 0}
-    
-
-def extract_text_regions_separately(image: np.ndarray, layout_info: Dict) -> List[Tuple[np.ndarray, str]]:
-    """Tách các vùng text riêng biệt để OCR"""
-    text_crops = []
-    
-    try:
-        if not layout_info['is_multiline'] or not layout_info['text_regions']:
-            return [(image, "single_line")]
-        
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
-        
-        for i, region in enumerate(layout_info['text_regions']):
-            x1, y1, x2, y2 = region['bbox']
-            
-            # Thêm padding nhỏ
-            padding = 3
-            x1 = max(0, x1 - padding)
-            y1 = max(0, y1 - padding)
-            x2 = min(gray.shape[1], x2 + padding)
-            y2 = min(gray.shape[0], y2 + padding)
-            
-            if x2 > x1 and y2 > y1:
-                crop = gray[y1:y2, x1:x2]
-                text_crops.append((crop, f"line_{i+1}"))
-        
-        return text_crops
-        
-    except Exception as e:
-        print(f"[ERROR] Text region extraction failed: {e}")
-        return [(image, "single_line")]
-    
+        return {
+            'is_multiline': False, 
+            'text_regions': [], 
+            'aspect_ratio': 1, 
+            'num_regions': 0,
+            'reading_direction': "left_to_right"
+        }    
 
 def clean_plate_text(text: str, is_multiline: bool = False) -> Optional[str]:
     """Cải tiến text cleaning cho biển số xe"""
@@ -471,114 +375,148 @@ def clean_plate_text(text: str, is_multiline: bool = False) -> Optional[str]:
         return None
     
     # Loại bỏ ký tự đặc biệt và chuẩn hóa
-    text = re.sub(r'[^\w\s\-\.]', '', text.upper().strip())
+    text = re.sub(r'[^\w\s\-\.\/]', '', text.upper().strip())
     
     # Sửa lỗi OCR
     ocr_corrections = {
-        'O': '0', 'I': '1', 'l': '1', '|': '1',
-        'S': '5', 'Z': '2', 'G': '6', 'B': '8',
-        'Q': '0', 'D': '0'
+        # Số vs chữ
+        'O': '0', 'I': '1', 'l': '1', '|': '1', 'L': '1',
+        'S': '5', 'Z': '2', 'G': '6', 'B': '8', 'Q': '0', 'D': '0',
+        # Ký tự đặc biệt
+        '@': '8', '?': '7', '%': '8', '&': '8',
+        # Khoảng trắng thừa
+        ' ': '', '\t': '', '\n': ' ' if is_multiline else ''
     }
     
     for wrong, correct in ocr_corrections.items():
         text = text.replace(wrong, correct)
+    def is_likely_reversed(text_part):
+        """Kiểm tra xem text có khả năng bị đảo ngược không"""
+        if len(text_part) < 4:
+            return False
+        
+        # Kiểm tra pattern: nếu bắt đầu bằng nhiều số thì có thể bị đảo
+        digit_start = sum(1 for c in text_part[:3] if c.isdigit())
+        digit_end = sum(1 for c in text_part[-3:] if c.isdigit())
+        
+        # Pattern Vietnam plate: thường bắt đầu bằng số (mã tỉnh) sau đó chữ
+        # Nếu cuối có nhiều số hơn đầu thì có thể bị đảo
+        if digit_end > digit_start and digit_end >= 2:
+            return True
+        return False
     
+    def fix_reversed_text(text_part):
+        """Sửa text bị đảo ngược"""
+        return text_part[::-1]
+
     if is_multiline:
         # Xử lý biển số 2 dòng
-        lines = [line.strip() for line in text.split('\n') if line.strip()]
+        lines = []
+        for line in text.split('\n'):
+            line = line.strip()
+            if line:
+                # Làm sạch từng dòng
+                cleaned_line = re.sub(r'[^A-Z0-9]', '', line)
+                if is_likely_reversed(cleaned_line):
+                    cleaned_line = fix_reversed_text(cleaned_line)
+                    print(f"[FIX] Detect reversed and fixed: {cleaned_line}")
+                if len(cleaned_line) >= 2:  # Tối thiểu 2 ký tự mỗi dòng
+                    lines.append(cleaned_line)
         
         if len(lines) >= 2:
-            # Ghép các dòng với dấu gạch ngang
-            line1 = re.sub(r'[^A-Z0-9]', '', lines[0])
-            line2 = re.sub(r'[^A-Z0-9]', '', lines[1])
-            
-            if line1 and line2:
-                combined = f"{line1}-{line2}"
-                if len(combined) >= 4:
-                    return combined
+            # Ghép với dấu gạch ngang
+            combined = f"{lines[0]}-{lines[1]}"
+            if len(combined) >= 5:  # Tối thiểu 5 ký tự (2-1-2)
+                return combined
+        elif len(lines) == 1 and len(lines[0]) >= 4:
+            # Trường hợp detect 1 dòng nhưng thực tế là 2 dòng
+            line = lines[0]
+
+            if is_likely_reversed(line):
+                line = fix_reversed_text(line)
+                print(f"[FIX] Reversed combined line detected and fixed: {line}")
+
+            if len(line) >= 6:  # Đủ để tách thành 2 phần
+                for split_pos in [2, 3]:
+                    if split_pos < len(line):
+                        part1 = line[:split_pos]
+                        part2 = line[split_pos:]
+
+                        if part1.isdigit() and len(part2) >= 4:
+                            return f"{part1}-{part2}"
+                        elif len(part2) >= 2 and part2.isdigit() and len(part2) >= 4:
+                            return f"{part1}-{part2}"
+                        
+                mid = len(line) // 2
+                part1 = line[:mid]
+                part2 = line[mid:]
+                return f"{part1}-{part2}"
+            return line
         
-        # Fallback: ghép tất cả thành 1 chuỗi
-        combined = ''.join(re.sub(r'[^A-Z0-9]', '', line) for line in lines)
+        # Fallback: ghép tất cả
+        combined = ''.join(lines)
         if len(combined) >= 4:
             return combined
     
     else:
         # Xử lý biển số 1 dòng
         cleaned = re.sub(r'[^A-Z0-9\-]', '', text)
-        if len(cleaned) >= 2:
+
+        if is_likely_reversed(cleaned):
+            cleaned = fix_reversed_text(cleaned)
+            print(f"[FIX] Reversed single line detected and fixed: {text} -> {cleaned}")
+
+        # Validate format cơ bản
+        if len(cleaned) >= 4 and len(cleaned) <= 15:  # Độ dài hợp lý
             return cleaned
     
     return None
 
 def clean_container_text(text: str) -> Optional[str]:
     """Xử lý text container code dọc"""
+    if not text:
+        return None
+        
     # Container format: 4 letters + 7 digits (e.g., ABCD1234567)
     text = re.sub(r'[^A-Z0-9]', '', text.upper().strip())
     
-    # Common OCR corrections
-    text = text.replace('O', '0').replace('I', '1').replace('S', '5')
+    # OCR corrections mở rộng
+    corrections = {
+        '0': 'O', 'I': '1', 'L': '1', 'S': '5', 'Z': '2', 
+        'G': '6', 'B': '8', 'Q': '0', 'D': '0',
+        '@': '8', '?': '7', '%': '8'
+    }
+
+    for wrong, correct in corrections.items():
+        text = text.replace(wrong, correct)
     
-    # Validate container format (at least 4 characters)
-    if len(text) >= 4:
+    # Kiểm tra và sửa lỗi đảo ngược
+    if len(text) >= 8:
+        # Pattern 1: số + chữ --> chữ + số
+        match_num_letters = re.match(r'^(\d{6,7})([A-Z]{4})$', text)
+        if match_num_letters:
+            numbers, letters = match_num_letters.groups()
+            corrected = letters + numbers
+            print(f"[FIX] Reversed pattern detected: {text} -> {corrected}")
+            return corrected
+        
+        # Pattern 2: Chữ + Số (đúng)
+        match_letters_num = re.match(r'^([A-Z]{4})(\d{6,7})$', text)
+        if match_letters_num:
+            return text
+            
+        # Pattern 3: Mixed characters - tách và sắp xếp lại
+        letters = ''.join([c for c in text if c.isalpha()])
+        numbers = ''.join([c for c in text if c.isdigit()])
+        
+        if len(letters) == 4 and len(numbers) >= 6:
+            return letters + numbers
+    
+    # Fallback validation
+    if len(text) >= 6:
         return text
     
     return None
-def clean_text(text: str, text_type: str) -> Optional[str]:
-    """Clean and validate OCR text based on type"""
-    if not text:
-        return None
-    
-    # Convert to uppercase and remove leading/trailing spaces
-    text = text.strip().upper()
-
-    if text_type == "plate":
-        # License plate: keep only letters, numbers, and hyphens
-        text = re.sub(r'[^A-Z0-9\-]', '', text)
-        if len(text) < 2:
-            return None
-        
-    elif text_type == "container":
-        # Container code: keep only letters and numbers
-        text = re.sub(r'[^A-Z0-9]', '', text)
-        # Common OCR corrections
-        text = text.replace('O', '0').replace('I', '1')
-        if len(text) < 4:
-            return None
-        
-    elif text_type == "seal":
-        # Seal: more flexible, allow word characters, hyphens, and dots
-        text = re.sub(r'[^\w\-\.]', '', text)
-        if len(text) < 2:
-            return None
-    
-    return text if text else None
-
-# ===== OCR FUNCTIONS =====
-@timeout_with_executor(OCR_TIMEOUT)
-def extract_text_with_easyocr_fast(image_crop: np.ndarray, text_type: str = "plate") -> Tuple[Optional[str], float]:
-    """Fast EasyOCR extraction as fallback"""
-    try:
-        if model_manager.ocr_models is None or model_manager.ocr_models.easy_ocr is None:
-            return None, 0.0
-            
-        if len(image_crop.shape) == 3:
-            gray = cv2.cvtColor(image_crop, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = image_crop
-            
-        results = model_manager.ocr_models.easy_ocr.readtext(gray, detail=1, width_ths=0.7, height_ths=0.7)
-        if not results:
-            return None, 0.0
-            
-        best_result = max(results, key=lambda x: x[2]) # type: ignore
-        text = best_result[1] # type: ignore
-        confidence = best_result[2] # type: ignore
-        cleaned_text = clean_text(text, text_type)
-        return cleaned_text, confidence if cleaned_text else 0.0 # type: ignore
-        
-    except Exception as e:
-        print(f"[FAILED] Fast EasyOCR failed: {e}")
-        return None, 0.0
 
 @timeout_with_executor(OCR_TIMEOUT)
 def extract_text_plate(image_crop: np.ndarray, ocr_models) -> Tuple[Optional[str], float]:
@@ -589,298 +527,473 @@ def extract_text_plate(image_crop: np.ndarray, ocr_models) -> Tuple[Optional[str
         # 1. Phát hiện layout
         layout_info = detect_plate_layout(image_crop)
         is_multiline = layout_info['is_multiline']
-        
+        reading_direction = layout_info.get('reading_direction', 'left_to_right')
         print(f"[INFO] Detected layout: {'Multiline' if is_multiline else 'Single line'}")
         
         # 2. Tiền xử lý chuyên biệt
-        processed_variants = preprocess_for_multiline_text(image_crop)
+        processed_variants = preprocess_for_plate_text(image_crop)
         
-        # 3. Tách vùng text nếu là multiline
-        if is_multiline:
-            text_regions = extract_text_regions_separately(image_crop, layout_info)
-        else:
-            text_regions = [(image_crop, "single_line")]
-        
-        # 4. OCR với nhiều phương pháp
-        for variant_idx, processed_img in enumerate(processed_variants):
-            
-            # Method 1: PaddleOCR
-            if hasattr(ocr_models, 'paddle_ocr') and ocr_models.paddle_ocr is not None:
-                try:
-                    paddle_results = ocr_models.paddle_ocr.ocr(processed_img, cls=True)
-                    if paddle_results and paddle_results[0]:
-                        if is_multiline:
-                            # Xử lý nhiều dòng
-                            lines = []
-                            for line in paddle_results[0]:
-                                lines.append(line[1][0])
-                            text = '\n'.join(lines)
-                        else:
-                            text = paddle_results[0][0][1][0]
-                        
-                        conf = paddle_results[0][0][1][1]
-                        cleaned = clean_plate_text(text, is_multiline)
-                        
-                        if cleaned and conf > 0.7:
-                            all_results.append(PlateResult(
-                                text=cleaned,
-                                confidence=conf,
-                                method=f"PaddleOCR_v{variant_idx}",
-                                is_multiline=is_multiline
-                            ))
+        # 3. OCR với nhiều phương pháp và scoring
+        for variant_idx, processed_img in enumerate(processed_variants[:4]):
+            # Fallback OCR strategy
+            ocr_attempts = []
+
+            # PaddleOCR
+            try:
+                if ocr_models.paddle_ocr:
+                    if len(processed_img.shape) == 2:
+                        processed_img = cv2.cvtColor(processed_img, cv2.COLOR_GRAY2BGR)
+                    elif processed_img.shape[2] == 1:
+                        processed_img = cv2.cvtColor(processed_img, cv2.COLOR_GRAY2BGR)
+
+                    paddle_results = ocr_models.paddle_ocr.ocr(processed_img)
+                    
+                    # Xử lý nhiều trường hợp trả về khác nhau
+                    texts = []
+                    confidences = []
+                    text_boxes = []
+                    
+                    if paddle_results is not None:
+                        # Trường hợp 1: paddle_results là list chứa list
+                        if isinstance(paddle_results, list) and len(paddle_results) > 0:
+                            first_result = paddle_results[0]
                             
-                except Exception as e:
-                    print(f"[ERROR] PaddleOCR variant {variant_idx} failed: {e}")
-            
-            # Method 2: EasyOCR với cấu hình multiline
-            if hasattr(ocr_models, 'easy_ocr') and ocr_models.easy_ocr is not None:
-                try:
+                            # Trường hợp 1a: first_result là list các detection
+                            if isinstance(first_result, list):
+                                for line in first_result:
+                                    try:
+                                        # Kiểm tra cấu trúc: [bbox, (text, confidence)]
+                                        if isinstance(line, list) and len(line) >= 2:
+                                            bbox = line[0]
+                                            text_info = line[1]
+                                            if isinstance(text_info, tuple) and len(text_info) >= 2:
+                                                text, conf = text_info[0], text_info[1]
+                                                if text and isinstance(text, str) and text.strip():
+                                                    # Tính toán vị trí trung tâm của bbox
+                                                    center_y = sum([p[1] for p in bbox]) / 4
+                                                    center_x = sum([p[0] for p in bbox]) / 4
+                                                    
+                                                    texts.append(text.strip())
+                                                    confidences.append(float(conf))
+                                                    text_boxes.append({'center_x': center_x, 'center_y': center_y})
+                                    except (IndexError, TypeError, ValueError) as line_e:
+                                        print(f"[WARN] Skipping malformed PaddleOCR line in variant {variant_idx}: {line_e}")
+                                        continue
+                                if texts and text_boxes:
+                                    # Kết hợp texts với positions
+                                    combined_data = list(zip(texts, confidences, text_boxes))
+                                    
+                                    if is_multiline:
+                                        # Sắp xếp theo Y trước (top to bottom), rồi X (left to right)
+                                        combined_data.sort(key=lambda x: (x[2]['center_y'], x[2]['center_x']))
+                                    else:
+                                        # Sắp xếp theo X (left to right)
+                                        combined_data.sort(key=lambda x: x[2]['center_x'])
+                                    
+                                    # Tách lại thành các list riêng biệt
+                                    texts = [item[0] for item in combined_data]
+                                    confidences = [item[1] for item in combined_data]
+                    
+                            
+                            # Trường hợp 1b: first_result là tuple (text, confidence)
+                            elif isinstance(first_result, tuple) and len(first_result) >= 2:
+                                text, conf = first_result[0], first_result[1]
+                                if text and isinstance(text, str) and text.strip():
+                                    texts.append(text.strip())
+                                    confidences.append(float(conf))
+                            
+                            # Trường hợp 1c: first_result là string
+                            elif isinstance(first_result, str) and first_result.strip():
+                                texts.append(first_result.strip())
+                                confidences.append(0.5)  # Default confidence
+                            
+                            # Trường hợp 1d: first_result là dict
+                            elif isinstance(first_result, dict) and 'rec_texts' in first_result and 'rec_scores' in first_result:
+                                try:
+                                    if 'rec_texts' in first_result and 'rec_scores' in first_result:
+                                        texts = [t.strip() for t in first_result['rec_texts'] if isinstance(t, str) and t.strip()]
+                                        confidences = [float(s) for s in first_result['rec_scores']]
+                                        if texts and confidences:
+                                            combined_text = ''.join(texts)
+                                            avg_conf = sum(confidences) / len(confidences)
+                                            cleaned = clean_container_text(combined_text)
+                                            if cleaned:
+                                                ocr_attempts.append((cleaned, avg_conf, f"PaddleOCR_v{variant_idx}"))
+                                                print(f"[SUCCESS] PaddleOCR container variant {variant_idx}: {cleaned} (conf: {avg_conf:.3f})")
+                                except Exception as parse_e:
+                                    print(f"[WARN] Failed to parse dict result in PaddleOCR container: {parse_e}")
+                        
+                        # Trường hợp 2: paddle_results trực tiếp là list các detection
+                        elif isinstance(paddle_results, list):
+                            for item in paddle_results:
+                                try:
+                                    if isinstance(item, list) and len(item) >= 2:
+                                        text_info = item[1]
+                                        if isinstance(text_info, tuple) and len(text_info) >= 2:
+                                            text, conf = text_info[0], text_info[1]
+                                            if text and isinstance(text, str) and text.strip():
+                                                texts.append(text.strip())
+                                                confidences.append(float(conf))
+                                except (IndexError, TypeError, ValueError):
+                                    continue
+                    
+                    # Xử lý kết quả thu được
+                    if texts and confidences:
+                        if is_multiline and len(texts) > 1:
+                            combined_text = '\n'.join(texts)
+                        else:
+                            combined_text = texts[0] if texts else ""
+                        
+                        avg_conf = sum(confidences) / len(confidences)
+                        cleaned = clean_plate_text(combined_text, is_multiline)
+                        
+                        if cleaned:
+                            ocr_attempts.append((cleaned, avg_conf, f"PaddleOCR_v{variant_idx}"))
+                            print(f"[SUCCESS] PaddleOCR variant {variant_idx}: {cleaned} (conf: {avg_conf:.3f})")
+                    else:
+                        print(f"[INFO] PaddleOCR variant {variant_idx} returned no valid text")
+                        
+            except Exception as e:
+                print(f"[ERROR] PaddleOCR variant {variant_idx} failed: {e}")
+
+
+            # Try EasyOCR
+            try:
+                if ocr_models.easy_ocr:
                     easy_results = ocr_models.easy_ocr.readtext(
                         processed_img,
                         allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-',
-                        width_ths=0.7,
-                        height_ths=0.4 if is_multiline else 0.7,
-                        paragraph=is_multiline
+                        width_ths=0.6,
+                        height_ths=0.3 if is_multiline else 0.6,
+                        paragraph=is_multiline,
+                        decoder='greedy'
                     )
-                    
-                    if easy_results:
-                        if is_multiline and len(easy_results) > 1:
-                            # Sắp xếp theo vị trí Y
-                            easy_results.sort(key=lambda x: x[0][0][1])
-                            texts = [result[1] for result in easy_results]
-                            text = '\n'.join(texts)
-                            conf = sum([result[2] for result in easy_results]) / len(easy_results)
-                        else:
-                            best_result = max(easy_results, key=lambda x: x[2])
-                            text = best_result[1]
-                            conf = best_result[2]
+                    if easy_results and isinstance(easy_results, list):
+                        valid_items = [r for r in easy_results if isinstance(r, (list, tuple)) and len(r) >= 3]
                         
-                        cleaned = clean_plate_text(text, is_multiline)
-                        
-                        if cleaned and conf > 0.6:
-                            all_results.append(PlateResult(
-                                text=cleaned,
-                                confidence=conf,
-                                method=f"EasyOCR_v{variant_idx}",
-                                is_multiline=is_multiline
-                            ))
+                        if valid_items:
+                            # IMPROVED: Sắp xếp theo vị trí
+                            if is_multiline:
+                                # Sắp xếp theo Y trước, rồi X
+                                valid_items.sort(key=lambda x: (x[0][0][1], x[0][0][0]))
+                            else:
+                                # Sắp xếp theo X
+                                valid_items.sort(key=lambda x: x[0][0][0])
                             
-                except Exception as e:
-                    print(f"[ERROR] EasyOCR variant {variant_idx} failed: {e}")
-            
-            # Method 3: Tesseract với PSM phù hợp
-            try:
-                if is_multiline:
-                    # PSM 6 cho text blocks
-                    config = r'--oem 3 --psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'
-                else:
-                    # PSM 8 cho single line
-                    config = r'--oem 3 --psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'
-                
-                text = pytesseract.image_to_string(processed_img, config=config).strip()
-                
-                if text:
-                    cleaned = clean_plate_text(text, is_multiline)
-                    if cleaned:
-                        all_results.append(PlateResult(
-                            text=cleaned,
-                            confidence=0.75,
-                            method=f"Tesseract_v{variant_idx}",
-                            is_multiline=is_multiline
-                        ))
+                            if is_multiline and len(valid_items) > 1:
+                                texts = [r[1] for r in valid_items]
+                                combined_text = '\n'.join(texts)
+                                avg_conf = sum([r[2] for r in valid_items]) / len(valid_items)
+                                cleaned = clean_plate_text(combined_text, is_multiline)
+                                if cleaned:
+                                    ocr_attempts.append((cleaned, avg_conf, f"EasyOCR_v{variant_idx}"))
+                                
+                            else:
+                                best_result = max(valid_items, key=lambda x: x[2])
+                                combined_text = best_result[1]
+                                avg_conf = best_result[2]
+                                cleaned = clean_plate_text(combined_text, is_multiline)
+                                if cleaned:
+                                    ocr_attempts.append((cleaned, avg_conf, f"EasyOCR_v{variant_idx}"))
                         
+                        else:
+                            print(f"[INFO] EasyOCR variant {variant_idx} returned empty or invalid format")
+
+            except Exception as e:
+                print(f"[ERROR] EasyOCR variant {variant_idx} failed: {e}")
+
+            # Try Tesseract
+            try:
+                tesseract_configs = [
+                    '--oem 3 --psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-',
+                    '--oem 3 --psm 4 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-',
+                    '--oem 3 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'
+                ]
+                for config_idx, config in enumerate(tesseract_configs):
+                    text = pytesseract.image_to_string(processed_img, config=config).strip()
+                    if text:
+                        cleaned = clean_plate_text(text, is_multiline)
+                        if cleaned:
+                            conf = 0.6 if config_idx == 0 else 0.5
+                            ocr_attempts.append((cleaned, conf, f"Tesseract_v{variant_idx}_c{config_idx}"))
             except Exception as e:
                 print(f"[ERROR] Tesseract variant {variant_idx} failed: {e}")
-        
-        # 5. Xử lý riêng từng vùng text nếu là multiline
-        if is_multiline and len(text_regions) > 1:
-            region_texts = []
-            region_confidences = []
-            
-            for region_img, region_name in text_regions:
-                best_region_result = None
-                best_region_conf = 0
-                
-                # OCR từng vùng
-                for processed_img in processed_variants[:3]:  # Chỉ dùng 3 variant tốt nhất
-                    
-                    # EasyOCR cho từng vùng
-                    try:
-                        easy_results = ocr_models.easy_ocr.readtext(
-                            region_img,
-                            allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
-                            width_ths=0.8,
-                            height_ths=0.8
-                        )
-                        
-                        if easy_results:
-                            best_result = max(easy_results, key=lambda x: x[2])
-                            text = best_result[1]
-                            conf = best_result[2]
-                            
-                            if conf > best_region_conf:
-                                best_region_result = text
-                                best_region_conf = conf
-                                
-                    except Exception as e:
-                        print(f"[ERROR] Region OCR failed: {e}")
-                
-                if best_region_result:
-                    cleaned_region = re.sub(r'[^A-Z0-9]', '', best_region_result.upper())
-                    if cleaned_region:
-                        region_texts.append(cleaned_region)
-                        region_confidences.append(best_region_conf)
-            
-            # Ghép các vùng lại
-            if len(region_texts) >= 2:
-                combined_text = '-'.join(region_texts)
-                avg_conf = sum(region_confidences) / len(region_confidences)
-                
-                all_results.append(PlateResult(
-                    text=combined_text,
-                    confidence=avg_conf,
-                    method="RegionBased_OCR",
-                    is_multiline=True
-                ))
-        
-        # 6. Chọn kết quả tốt nhất
+
+            # Append best attempt
+            if ocr_attempts:
+                best = max(ocr_attempts, key=lambda x: x[1])
+                if best[1] > 0.3:
+                    bonus = 0.1 if variant_idx < 4 else 0
+                    final_conf = min(best[1] + bonus, 1.0)
+                    all_results.append(PlateResult(
+                        text=best[0],
+                        confidence=final_conf,
+                        method=best[2],
+                        is_multiline=is_multiline
+                    ))
+
         if all_results:
-            # Ưu tiên theo method và confidence
-            priority_methods = ['PaddleOCR', 'RegionBased', 'EasyOCR', 'Tesseract']
+            # Voting
+            if len(all_results) >= 3:
+                votes = {}
+                for res in all_results:
+                    if res.text in votes:
+                        votes[res.text]['count'] += 1
+                        votes[res.text]['conf'] += res.confidence
+                    else:
+                        votes[res.text] = {'count': 1, 'conf': res.confidence}
+
+                for t, v in votes.items():
+                    if v['count'] >= 2:
+                        avg_conf = v['conf'] / v['count']
+                        bonus = 0.1 * (v['count'] - 1)
+                        all_results.append(PlateResult(
+                            text=t,
+                            confidence=min(avg_conf + bonus, 1.0),
+                            method=f"Consensus_{v['count']}",
+                            is_multiline=is_multiline
+                        ))
+
+            # Score & chọn kết quả tốt nhất
+            def score(r):
+                base = r.confidence
+                method_bonus = 0.1 if 'PaddleOCR' in r.method else 0.05 if 'EasyOCR' in r.method else 0
+                multiline_bonus = 0.05 if r.is_multiline else 0
+                
+                # Pattern validation bonus
+                text_clean = r.text.replace('-', '').replace('\n', '')
+                length_bonus = 0.05 if 6 <= len(text_clean) <= 10 else -0.1
+                
+                # Vietnam license plate pattern bonus
+                vietnam_pattern_bonus = 0
+                if re.match(r'^\d{2}[A-Z]\d{4,6}$', text_clean):  # 12A34567
+                    vietnam_pattern_bonus = 0.1
+                elif re.match(r'^\d{2}[A-Z]{2}\d{4,6}$', text_clean):  # 12AB34567
+                    vietnam_pattern_bonus = 0.1
+                elif re.match(r'^\d{2}[A-Z]\d{3}\.\d{2}$', text_clean):  # 12A123.45
+                    vietnam_pattern_bonus = 0.1
+                
+                return base + method_bonus + multiline_bonus + length_bonus + vietnam_pattern_bonus
             
-            def get_method_priority(method_name):
-                for i, priority in enumerate(priority_methods):
-                    if priority in method_name:
-                        return i
-                return len(priority_methods)
-            
-            # Sắp xếp theo confidence và method priority
-            all_results.sort(key=lambda x: (-x.confidence, get_method_priority(x.method)))
-            
+            all_results.sort(key=score, reverse=True)
             best_result = all_results[0]
             print(f"[SUCCESS] Best result: {best_result.text} (conf: {best_result.confidence:.3f}, method: {best_result.method})")
-            
             return best_result.text, best_result.confidence
-        
-        return None, 0.0
-        
-    except Exception as e:
-        print(f"[FAILED] Enhanced multiline plate OCR failed: {e}")
+
         return None, 0.0
 
+    except Exception as e:
+        print(f"[FAILED] Enhanced plate OCR failed: {e}")
+        return None, 0.0
+
+    
 @timeout_with_executor(OCR_TIMEOUT)
 def extract_text_container(image_crop: np.ndarray, ocr_models: OCRModels) -> Tuple[Optional[str], float]:
     """Enhanced OCR for container codes with vertical text support"""
-    results = []
+    all_results = []
     
     try:
         # Preprocessing for container codes
-        processed_images = []
-        
-        gray = cv2.cvtColor(image_crop, cv2.COLOR_BGR2GRAY) if len(image_crop.shape) == 3 else image_crop
+        processed_images = preprocess_for_container_text(image_crop)
         
         # Detect orientation
         orientation = detect_text_orientation(image_crop)
         
-        # Resize if needed
-        h, w = gray.shape
-        if h < 80 or w < 200:
-            scale = max(80/h, 200/w, 1.5)
-            gray = cv2.resize(gray, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_CUBIC)
-        
-        # Multiple preprocessing
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        enhanced = clahe.apply(gray)
-        denoised = cv2.fastNlMeansDenoising(enhanced, None, 8, 7, 21)
-        processed_images.append(denoised)
-        
-        # For vertical text
-        kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1,3))
-        morph_v = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel_v)
-        processed_images.append(morph_v)
-        
-        # Rotation handling
+        # Thêm rotation variants nếu cần
         if orientation == "vertical":
-            for angle in [90, -90, 180]:
+            gray = cv2.cvtColor(image_crop, cv2.COLOR_BGR2GRAY) if len(image_crop.shape) == 3 else image_crop
+            h, w = gray.shape
+            
+            for angle in [90, -90]:
                 center = (w//2, h//2)
                 rotation_matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
-                rotated = cv2.warpAffine(gray, rotation_matrix, (w, h))
+                rotated = cv2.warpAffine(gray, rotation_matrix, (w, h), borderValue=255) # type: ignore
                 processed_images.append(rotated)
         
         # ===== OCR METHODS =====
-        
-        # 1. PaddleOCR
-        if ocr_models.paddle_ocr is not None:
-            for i, processed in enumerate(processed_images):
+        # Fallback OCR
+        for variant_idx, processed_img in enumerate(processed_images[:6]):
+            ocr_attempts = []
+
+            # PaddleOCR
+            if ocr_models.paddle_ocr:
                 try:
-                    paddle_results = ocr_models.paddle_ocr.ocr(processed, cls=True)
-                    if paddle_results and paddle_results[0]:
-                        for line in paddle_results[0]:
-                            text = line[1][0]
-                            conf = line[1][1]
-                            cleaned = clean_container_text(text)
-                            if cleaned and conf > 0.75:
-                                results.append((cleaned, conf, f"PaddleOCR_{i}"))
+                    if len(processed_img.shape) == 2:
+                        processed_img = cv2.cvtColor(processed_img, cv2.COLOR_GRAY2BGR)
+
+                    paddle_res = ocr_models.paddle_ocr.ocr(processed_img)
+                    texts, confs = [], []
+
+                    if isinstance(paddle_res, list) and len(paddle_res) > 0:
+                        first = paddle_res[0]
+
+                        # Trường hợp list các dòng text
+                        if isinstance(first, list):
+                            try:
+                                if orientation == "vertical":
+                                    # Sắp xếp theo y (trên xuống dưới)
+                                    first = sorted(first, key=lambda x: (sum([p[1] for p in x[0]]) / 4, sum([p[0] for p in x[0]]) / 4))
+                                else:
+                                    # Sắp xếp theo x (trái sang phải)
+                                    first = sorted(first, key=lambda x: (sum([p[1] for p in x[0]]) / 4, sum([p[0] for p in x[0]]) / 4))
+                            except Exception:
+                                pass
+
+                            for line in first:
+                                try:
+                                    if isinstance(line, list) and len(line) >= 2:
+                                        text_info = line[1]
+                                        if isinstance(text_info, tuple) and len(text_info) >= 2:
+                                            text, conf = text_info[0], text_info[1]
+                                            if text and isinstance(text, str):
+                                                texts.append(text.strip())
+                                                confs.append(float(conf))
+                                        elif isinstance(text_info, str):
+                                            texts.append(text_info.strip())
+                                            confs.append(0.5)
+                                except Exception as e:
+                                    print(f"[WARN] Skipping malformed line: {e}")
+
+                        # Trường hợp tuple
+                        elif isinstance(first, tuple) and len(first) >= 2:
+                            text, conf = first
+                            if text and isinstance(text, str):
+                                texts.append(text.strip())
+                                confs.append(float(conf))
+
+                        # Trường hợp string
+                        elif isinstance(first, str):
+                            texts.append(first.strip())
+                            confs.append(0.5)
+
+                        # Trường hợp dict có rec_texts / rec_scores
+                        elif isinstance(first, dict):
+                            try:
+                                raw_texts = first.get('rec_texts', [])
+                                raw_scores = first.get('rec_scores', [])
+                                if raw_texts and raw_scores:
+                                    texts = [t.strip() for t in raw_texts if isinstance(t, str)]
+                                    confs = [float(s) for s in raw_scores]
+                            except Exception as parse_e:
+                                print(f"[WARN] Failed to parse dict: {parse_e}")
+
+                    if texts and confs:
+                        combined = ''.join(texts)
+                        avg_conf = sum(confs) / len(confs)
+                        cleaned = clean_container_text(combined)
+                        if cleaned:
+                            ocr_attempts.append((cleaned, avg_conf, f"PaddleOCR_v{variant_idx}"))
+                    else:
+                        print(f"[INFO] PaddleOCR container variant {variant_idx} returned no valid text")
+
                 except Exception as e:
-                    print(f"[ERROR] PaddleOCR container method {i} failed: {e}")
-        
-        # 2. EasyOCR
-        if ocr_models.easy_ocr is not None:
-            for i, processed in enumerate(processed_images):
+                    print(f"[ERROR] PaddleOCR variant {variant_idx} failed: {e}")
+
+            # ===== EasyOCR =====
+            if ocr_models.easy_ocr:
                 try:
-                    easy_results = ocr_models.easy_ocr.readtext(
-                        processed,
+                    easy_results= ocr_models.easy_ocr.readtext(
+                        processed_img,
                         allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
-                        width_ths=0.8, height_ths=0.8
+                        width_ths=0.8,
+                        height_ths=0.3,
+                        paragraph=False,
+                        slope_ths=0.1,
+                        decoder="beamsearch",
                     )
-                    
-                    if easy_results:
+                    if isinstance(easy_results, list) and easy_results:
+                        # Lọc các kết quả hợp lệ (tuple/list có đủ >= 3 phần tử)
+                        valid_easy = [r for r in easy_results if isinstance(r, (list, tuple)) and len(r) >= 3]
+    
+                        if valid_easy:
+                            if orientation == "vertical":
+                                valid_easy = sorted(valid_easy, key=lambda x: (x[0][0][1], x[0][0][0]))  # y then x
+                            else:
+                                valid_easy = sorted(valid_easy, key=lambda x: (x[0][0][1], x[0][0][0]))  # y then x
+                            
                         if orientation == "vertical":
-                            combined_text = ''.join([r[1] for r in easy_results]) # type: ignore
-                            cleaned = clean_container_text(combined_text)
-                            if cleaned:
-                                avg_conf = sum([r[2] for r in easy_results]) / len(easy_results) # type: ignore
-                                results.append((cleaned, avg_conf, f"EasyOCR_Vertical_{i}"))
+                            combined = ''.join([r[1] for r in valid_easy])
+                            avg_conf = sum([r[2] for r in valid_easy]) / len(valid_easy)
                         else:
-                            best_result = max(easy_results, key=lambda x: x[2]) # type: ignore
-                            text, conf = best_result[1], best_result[2] # type: ignore
-                            cleaned = clean_container_text(text)
-                            if cleaned and conf > 0.7: # type: ignore
-                                results.append((cleaned, conf, f"EasyOCR_{i}"))
-                                
+                            # Lấy kết quả có confidence cao nhất
+                            best_result = max(valid_easy, key=lambda x: x[2])
+                            combined = best_result[1]
+                            avg_conf = best_result[2]
+    
+                        cleaned = clean_container_text(combined)
+                        if cleaned and avg_conf > 0.3:
+                            ocr_attempts.append((cleaned, avg_conf, f"EasyOCR_v{variant_idx}"))
+                            print(f"[SUCCESS] EasyOCR container variant {variant_idx}: {cleaned} (conf: {avg_conf:.3f})")
+                    else:
+                        print(f"[INFO] EasyOCR container variant {variant_idx} returned no valid result")
+
                 except Exception as e:
-                    print(f"[ERROR] EasyOCR container method {i} failed: {e}")
-        
-        # 3. Tesseract
-        for i, processed in enumerate(processed_images):
+                    print(f"[ERROR] EasyOCR container variant {variant_idx} failed: {e}")
+
+            # ===== Tesseract =====
             try:
-                text = pytesseract.image_to_string(processed, config=ocr_models.container_config).strip()
-                if text:
+                configs = [
+                    '--oem 3 --psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+                    '--oem 3 --psm 4 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+                    '--oem 3 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+                ]
+                for c_idx, config in enumerate(configs):
+                    text = pytesseract.image_to_string(processed_img, config=config).strip()
                     cleaned = clean_container_text(text)
                     if cleaned:
-                        results.append((cleaned, 0.75, f"Tesseract_{i}"))
+                        conf = 0.75 if variant_idx < 3 else 0.6
+                        ocr_attempts.append((cleaned, conf, f"Tesseract_v{variant_idx}_c{c_idx}"))
             except Exception as e:
-                print(f"[ERROR] Tesseract container method {i} failed: {e}")
-        
-        # Choose best result
-        if results:
-            priority_order = ['PaddleOCR', 'EasyOCR', 'Tesseract']
-            
-            def get_priority(method_name):
-                for i, priority in enumerate(priority_order):
-                    if priority in method_name:
-                        return i
-                return len(priority_order)
-            
-            results.sort(key=lambda x: (-x[1], get_priority(x[2])))
-            best_result = results[0]
-            return best_result[0], best_result[1]
-        
+                print(f"[ERROR] Tesseract variant {variant_idx} failed: {e}")
+
+            if ocr_attempts:
+                best = max(ocr_attempts, key=lambda x: x[1])
+                if best[1] > 0.3:
+                    bonus = 0.05 if variant_idx < 4 else 0
+                    final_conf = min(best[1] + bonus, 1.0)
+                    all_results.append(ContainerResult(
+                        text=best[0],
+                        confidence=final_conf,
+                        method=best[2]
+                    ))
+
+        # ===== Voting =====
+        if len(all_results) >= 2:
+            votes = {}
+            for res in all_results:
+                if res.text in votes:
+                    votes[res.text]['count'] += 1
+                    votes[res.text]['conf'] += res.confidence
+                else:
+                    votes[res.text] = {'count': 1, 'conf': res.confidence}
+            for t, v in votes.items():
+                if v['count'] >= 2:
+                    avg_conf = v['conf'] / v['count']
+                    bonus = 0.1 * (v['count'] - 1)
+                    all_results.append(ContainerResult(
+                        text=t,
+                        confidence=min(avg_conf + bonus, 1.0),
+                        method=f"Consensus_{v['count']}"
+                    ))
+
+        if all_results:
+            def score(r):
+                base = r.confidence
+                method_bonus = 0.1 if 'PaddleOCR' in r.method else 0.05 if 'EasyOCR' in r.method else 0
+                length_bonus = 0.05 if 8 <= len(r.text) <= 12 else -0.1
+                return base + method_bonus + length_bonus
+
+            all_results.sort(key=score, reverse=True)
+            best = all_results[0]
+            print(f"[SUCCESS] Best container result: {best.text} (conf: {best.confidence:.3f}, method: {best.method})")
+            return best.text, best.confidence
+
         return None, 0.0
-        
+
     except Exception as e:
         print(f"[FAILED] Enhanced container OCR failed: {e}")
         return None, 0.0
+
 
 # ===== DETECTION FUNCTIONS =====
 def detect_plates(frame: np.ndarray) -> List[Dict]:
@@ -894,7 +1007,7 @@ def detect_plates(frame: np.ndarray) -> List[Dict]:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             
             # Bỏ qua detection confidence quá thấp
-            if conf < 0.12:
+            if conf < 0.4:
                 results.append({
                     "type": "plate",
                     "box": [x1, y1, x2, y2],
@@ -917,7 +1030,12 @@ def detect_plates(frame: np.ndarray) -> List[Dict]:
             cropped = frame[y1_c:y2_c, x1_c:x2_c]
 
             # Sử dụng OCR cải tiến
-            text, ocr_conf = extract_text_plate(cropped, model_manager.ocr_models)
+            result = extract_text_plate(cropped, model_manager.ocr_models)
+            if result is None or not isinstance(result, tuple):
+                print(f"[TIMEOUT] extract_text_plate timed out or failed for box: {[x1, y1, x2, y2]}")
+                text, ocr_conf = None, 0.0
+            else:
+                text, ocr_conf = result
             
             results.append({
                 "type": "plate",
@@ -930,7 +1048,15 @@ def detect_plates(frame: np.ndarray) -> List[Dict]:
     
     except Exception as e:
         print(f"[FAILED] Enhanced plate detection failed: {e}")
-    
+
+        results.append({
+                    "type": "plate", 
+                    "box": [x1, y1, x2, y2],
+                    "text": None,
+                    "confidence": conf,
+                    "error": str(e)
+                })
+        
     return results
 
 def detect_containers(frame: np.ndarray) -> List[Dict]:
@@ -953,9 +1079,9 @@ def detect_containers(frame: np.ndarray) -> List[Dict]:
                 })
                 continue
 
-            # Crop with padding
+            # Crop với padding phù hợp
             h, w = frame.shape[:2]
-            padding = 8
+            padding = 8  # Tăng padding để capture đầy đủ text
             x1_c = max(0, x1 - padding)
             y1_c = max(0, y1 - padding)
             x2_c = min(w, x2 + padding)
@@ -965,18 +1091,32 @@ def detect_containers(frame: np.ndarray) -> List[Dict]:
                 continue
                 
             cropped = frame[y1_c:y2_c, x1_c:x2_c]
-            text, ocr_conf = extract_text_container(cropped, model_manager.ocr_models) # type: ignore
-            
+
+            result = extract_text_container(cropped, model_manager.ocr_models) # type: ignore
+            if result is None or not isinstance(result, tuple):
+                print(f"[TIMEOUT] extract_text_container timed out or failed for box: {[x1, y1, x2, y2]}")
+                text, ocr_conf = None, 0.0
+            else:
+                text, ocr_conf = result
+
             results.append({
                 "type": "container",
                 "box": [x1, y1, x2, y2],
                 "text": text,
-                "confidence": ocr_conf if text else conf
+                "confidence": ocr_conf if text else conf,
+                "detection_confidence": conf,
+                "ocr_confidence": ocr_conf if text else 0.0
             })
     
     except Exception as e:
-        print(f"[ERROR] Container detection failed: {e}")
-    
+        print(f"[FAILED] Enhanced container detection failed: {e}")
+        results.append({
+                    "type": "container", 
+                    "box": [x1, y1, x2, y2],
+                    "text": None,
+                    "confidence": conf,
+                    "error": str(e)
+                })
     return results
 
 def detect_faces(frame):
@@ -987,7 +1127,6 @@ def detect_faces(frame):
     results = []
     try:
         img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mtcnn = model_manager.face_models['mtcnn']
         boxes, probs = mtcnn.detect(img_rgb) # type: ignore
 
         if boxes is None or len(boxes) == 0:
@@ -1047,7 +1186,8 @@ def draw_detections(frame, detections):
     for det in detections:
         x1, y1, x2, y2 = det["box"]
         det_type = det["type"]
-        text = det["text"] if det["text"] is not None else "None"
+        text = det["text"] if det["text"] else "None"
+
         conf = det["confidence"]
         color = colors.get(det_type, (255, 255, 255))
         
@@ -1066,15 +1206,23 @@ def process_image(frame):
     """Main image processing function with timeout protection"""
     detections = []
     try:
+
+        print(f"[DEBUG] Processing frame shape: {frame.shape}")
+
         # Sequential detection to ensure OCR completes before moving on
         plate_detections = detect_plates(frame)
         detections.extend(plate_detections)
+        print(f"[DEBUG] Plate detections: {plate_detections}")
 
         container_detections = detect_containers(frame)
         detections.extend(container_detections)
+        print(f"[DEBUG] Container detections: {container_detections}")
 
         face_detections = detect_faces(frame)
         detections.extend(face_detections)
+
+        metadata = extract_metadata(detections)
+        print(f"[DEBUG] Final metadata: {metadata}")
 
         # Draw annotations
         annotated = draw_detections(frame.copy(), detections)
@@ -1087,12 +1235,17 @@ def process_image(frame):
 def extract_metadata(detections: List[Dict[str, Any]]) -> Dict[str, str]:
     """Extract metadata from detections"""
     metadata = {"plate": "None", "container": "None", "face": "None", "seal": "None"}
+
+    if debug:
+        print(f"[DEBUG] Input detections: {detections}")
     
     for det in detections:
         det_type = det["type"]
-        text = det["text"]
+        text = det.get("text", None)
         
         if text is not None and text != "None":
+            if debug:
+                print(f"[DEBUG] Setting {det_type} = {text}")
             metadata[det_type] = text
     
     return metadata
@@ -1157,77 +1310,171 @@ def get_video_feed():
 
 @app.websocket("/ws/combined-detection")
 async def websocket_combined_detection(websocket: WebSocket):
-    """Main WebSocket endpoint for combined detection"""
+    """WebSocket endpoint được tối ưu cho xử lý batch images"""
     await websocket.accept()
     print("[WebSocket] Client connected")
     
     try:
         while True:
-            # Receive message with timeout
             try:
-                raw_message = await asyncio.wait_for(
-                    websocket.receive_text(), 
-                    timeout=WEBSOCKET_TIMEOUT
-                )
-            except asyncio.TimeoutError:
-                print("[WebSocket] Receive timeout, sending ping")
-                await websocket.ping() # type: ignore
-                continue
-            
-            try:
+                # Không sử dụng timeout cho việc nhận tin nhắn
+                # Thay vào đó dựa vào việc client gửi liên tục
+                raw_message = await websocket.receive_text()
+                
                 message = json.loads(raw_message)
-                frame_b64 = message.get("image")
                 
-                if not frame_b64:
+                # Xử lý batch images
+                if message.get("type") == "batch":
+                    images = message.get("images", [])
+                    batch_results = []
+                    
+                    for idx, frame_b64 in enumerate(images):
+                        if not frame_b64:
+                            batch_results.append({
+                                "image_index": idx,
+                                "success": False,
+                                "error": "No image data"
+                            })
+                            continue
+                        
+                        try:
+                            # Decode và xử lý ảnh
+                            img_data = base64.b64decode(frame_b64)
+                            nparr = np.frombuffer(img_data, np.uint8)
+                            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                            
+                            if frame is None:
+                                batch_results.append({
+                                    "image_index": idx,
+                                    "success": False,
+                                    "error": "Cannot decode image"
+                                })
+                                continue
+                            
+                            # Xử lý ảnh
+                            start_time = time.time()
+                            result = process_image(frame)
+                            
+                            if result is None:
+                                batch_results.append({
+                                    "image_index": idx,
+                                    "success": False,
+                                    "error": "Processing timeout"
+                                })
+                                continue
+                            
+                            annotated_frame, detections = result
+                            processing_time = (time.time() - start_time) * 1000
+                            
+                            # Extract metadata
+                            metadata = extract_metadata(detections)
+                            
+                            # Encode response (tùy chọn có trả về ảnh hay không)
+                            annotated_b64 = None
+                            if message.get("return_images", False):
+                                _, buffer = cv2.imencode('.jpg', annotated_frame, 
+                                                       [cv2.IMWRITE_JPEG_QUALITY, 70])
+                                annotated_b64 = base64.b64encode(buffer).decode('utf-8') # type: ignore
+                            
+                            batch_results.append({
+                                "image_index": idx,
+                                "success": True,
+                                "image": annotated_b64,
+                                "detections": detections,
+                                "metadata": metadata,
+                                "processing_time_ms": round(processing_time, 2)
+                            })
+                            
+                            # Gửi kết quả ngay lập tức cho từng ảnh (streaming results)
+                            if message.get("stream_results", False):
+                                await websocket.send_text(json.dumps({
+                                    "type": "progress",
+                                    "image_index": idx,
+                                    "total_images": len(images),
+                                    "result": batch_results[-1]
+                                }))
+                        
+                        except Exception as e:
+                            print(f"[WebSocket Error] Processing image {idx}: {e}")
+                            batch_results.append({
+                                "image_index": idx,
+                                "success": False,
+                                "error": f"Processing error: {str(e)}"
+                            })
+                    
+                    # Gửi kết quả cuối cùng cho toàn bộ batch
+                    if not message.get("stream_results", False):
+                        response = {
+                            "type": "batch_complete",
+                            "success": True,
+                            "total_processed": len(images),
+                            "results": batch_results
+                        }
+                        await websocket.send_text(json.dumps(response))
+                
+                # Xử lý single image (giữ nguyên logic cũ nhưng tối ưu)
+                elif message.get("type") == "single" or "image" in message:
+                    frame_b64 = message.get("image")
+                    
+                    if not frame_b64:
+                        await websocket.send_text(json.dumps({
+                            "success": False,
+                            "error": "No image data received"
+                        }))
+                        continue
+                    
+                    # Decode và xử lý
+                    img_data = base64.b64decode(frame_b64)
+                    nparr = np.frombuffer(img_data, np.uint8)
+                    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                    
+                    if frame is None:
+                        await websocket.send_text(json.dumps({
+                            "success": False,
+                            "error": "Cannot decode image"
+                        }))
+                        continue
+                    
+                    # Process image
+                    start_time = time.time()
+                    result = process_image(frame)
+                    
+                    if result is None:
+                        await websocket.send_text(json.dumps({
+                            "success": False,
+                            "error": "Processing timeout"
+                        }))
+                        continue
+                    
+                    annotated_frame, detections = result
+                    processing_time = (time.time() - start_time) * 1000
+                    
+                    # Extract metadata và update global state
+                    metadata = extract_metadata(detections)
+                    update_latest_frame_and_metadata(annotated_frame, metadata)
+                    
+                    # Encode response
+                    _, buffer = cv2.imencode('.jpg', annotated_frame, 
+                                           [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    annotated_b64 = base64.b64encode(buffer).decode('utf-8') # type: ignore
+                    
+                    response = {
+                        "type": "single_complete",
+                        "success": True,
+                        "image": annotated_b64,
+                        "detections": detections,
+                        "metadata": metadata,
+                        "processing_time_ms": round(processing_time, 2)
+                    }
+                    
+                    await websocket.send_text(json.dumps(response))
+                
+                # Heartbeat/ping handling
+                elif message.get("type") == "ping":
                     await websocket.send_text(json.dumps({
-                        "success": False,
-                        "error": "No image data received"
+                        "type": "pong",
+                        "timestamp": time.time()
                     }))
-                    continue
-                
-                # Decode image
-                img_data = base64.b64decode(frame_b64)
-                nparr = np.frombuffer(img_data, np.uint8)
-                frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                
-                if frame is None:
-                    await websocket.send_text(json.dumps({
-                        "success": False,
-                        "error": "Cannot decode image"
-                    }))
-                    continue
-                
-                # Process image with timeout protection
-                start_time = time.time()
-                result = process_image(frame)
-                
-                if result is None:
-                    await websocket.send_text(json.dumps({
-                        "success": False,
-                        "error": "Processing timeout"
-                    }))
-                    continue
-                
-                annotated_frame, detections = result
-                processing_time = (time.time() - start_time) * 1000  # ms
-                
-                # Extract metadata and update global state
-                metadata = extract_metadata(detections)
-                update_latest_frame_and_metadata(annotated_frame, metadata)
-                
-                # Encode response
-                _, buffer = cv2.imencode('.jpg', annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                annotated_b64 = base64.b64encode(buffer).decode('utf-8') # type: ignore
-                
-                response = {
-                    "success": True,
-                    "image": annotated_b64,
-                    "detections": detections,
-                    "metadata": metadata,
-                    "processing_time_ms": round(processing_time, 2)
-                }
-                
-                await websocket.send_text(json.dumps(response))
                 
             except json.JSONDecodeError:
                 await websocket.send_text(json.dumps({
@@ -1246,26 +1493,167 @@ async def websocket_combined_detection(websocket: WebSocket):
     except Exception as e:
         print(f"[WebSocket Error] Connection error: {e}")
 
-@app.websocket("/ws/flutter-metadata")
-async def websocket_flutter_metadata(websocket: WebSocket):
-    """WebSocket endpoint for Flutter app metadata only"""
+
+# Thêm endpoint WebSocket tối ưu cho batch processing
+@app.websocket("/ws/batch-detection")
+async def websocket_batch_detection(websocket: WebSocket):
+    """WebSocket endpoint chuyên biệt cho batch processing"""
     await websocket.accept()
-    print("[Flutter WebSocket] Client connected")
+    print("[WebSocket Batch] Client connected")
     
     try:
-        last_metadata = None
         while True:
-            with global_state.frame_lock:
-                current_metadata = global_state.latest_metadata.copy()  # Sửa ở đây
+            # Nhận message mà không timeout
+            raw_message = await websocket.receive_text()
+            message = json.loads(raw_message)
             
-            # Only send if metadata has changed
-            if current_metadata != last_metadata:
-                await websocket.send_json(current_metadata)
-                last_metadata = current_metadata.copy()
+            images = message.get("images", [])
+            if not images:
+                await websocket.send_text(json.dumps({
+                    "success": False,
+                    "error": "No images provided"
+                }))
+                continue
             
-            await asyncio.sleep(0.1)  # 100ms polling interval
+            print(f"[Batch] Processing {len(images)} images")
+            processed_count = 0
+            
+            for idx, frame_b64 in enumerate(images):
+                try:
+                    # Decode image
+                    img_data = base64.b64decode(frame_b64)
+                    nparr = np.frombuffer(img_data, np.uint8)
+                    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                    
+                    if frame is None:
+                        continue
+                    
+                    # Process image
+                    result = process_image(frame)
+                    if result is None:
+                        continue
+                    
+                    annotated_frame, detections = result
+                    metadata = extract_metadata(detections)
+                    processed_count += 1
+                    
+                    # Gửi progress update
+                    progress_response = {
+                        "type": "progress",
+                        "image_index": idx,
+                        "total_images": len(images),
+                        "processed": processed_count,
+                        "metadata": metadata,
+                        "detections": len(detections)
+                    }
+                    
+                    await websocket.send_text(json.dumps(progress_response))
+                    
+                    # Update global state with latest result
+                    update_latest_frame_and_metadata(annotated_frame, metadata)
+                    
+                except Exception as e:
+                    print(f"[Batch Error] Image {idx}: {e}")
+                    continue
+            
+            # Send completion message
+            completion_response = {
+                "type": "batch_complete",
+                "success": True,
+                "total_images": len(images),
+                "processed_count": processed_count,
+                "completion_time": time.time()
+            }
+            
+            await websocket.send_text(json.dumps(completion_response))
             
     except WebSocketDisconnect:
-        print("[Flutter WebSocket] Client disconnected")
+        print("[WebSocket Batch] Client disconnected")
     except Exception as e:
-        print(f"[Flutter WebSocket Error] {e}")
+        print(f"[WebSocket Batch Error] {e}")
+
+
+# Endpoint REST API thay thế cho batch processing
+@app.post("/process-batch")
+async def process_batch_images(request: Request):
+    """REST API endpoint cho batch image processing"""
+    request_id = str(uuid.uuid4())[:8]
+    print(f"[{request_id}] Starting batch processing")
+
+    try:
+        data = await request.json() # type: ignore
+        images = data.get("images", [])
+        
+        if not images:
+            return JSONResponse({
+                "success": False,
+                "error": "No images provided"
+            }, status_code=400)
+        
+        results = []
+        for idx, frame_b64 in enumerate(images):
+            try:
+                # Decode image
+                img_data = base64.b64decode(frame_b64)
+                nparr = np.frombuffer(img_data, np.uint8)
+                frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                
+                if frame is None:
+                    results.append({
+                        "image_index": idx,
+                        "success": False,
+                        "error": "Cannot decode image"
+                    })
+                    print(f"[WARNING] Failed to decode image {idx}")
+                    continue
+                
+                # Process image
+                start_time = time.time()
+                result = process_image(frame)
+                
+                if result is None:
+                    results.append({
+                        "image_index": idx,
+                        "success": False,
+                        "error": "Processing failed"
+                    })
+                    continue
+                
+                annotated_frame, detections = result
+                processing_time = (time.time() - start_time) * 1000
+                metadata = extract_metadata(detections)
+                
+                results.append({
+                    "image_index": idx,
+                    "success": True,
+                    "detections": detections,
+                    "metadata": metadata,
+                    "processing_time_ms": round(processing_time, 2)
+                })
+
+                print(f"[DEBUG] Receiving batch with {len(images)} images")
+                
+            except Exception as e:
+                results.append({
+                    "image_index": idx,
+                    "success": False,
+                    "error": str(e)
+                })
+        print(f"[{request_id}] Results: {results}")
+        return JSONResponse({
+            "success": True,
+            "total_processed": len([r for r in results if r["success"]]),
+            "total_images": len(images),
+            "results": results
+        })
+    
+        
+    except Exception as e:
+        return JSONResponse({
+            "success": False,
+            "error": str(e)
+        }, status_code=500)
+
+
+# trường hợp timeout, timeout_with_executor(...) sẽ trả về None chứ không trả về Tuple (None, 0.0) gây lỗi NoneType
+
