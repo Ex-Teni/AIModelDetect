@@ -1,130 +1,94 @@
-# client_camera.py - FIXED VERSION
-import asyncio
-import json
-import websockets
-import base64
+import os
 import cv2
+import base64
+import requests
 import numpy as np
 
-async def send_frames(uri):
-    cap = cv2.VideoCapture(0)
-    # cap = cv2.VideoCapture("rtsp://<username>:<password>@<ip_address>:<port>/path") # Thay bằng rtsp camera
-    if not cap.isOpened():
-        print("[ERROR] Cannot open webcam")
+# === Cấu hình ===
+API_URL = "http://localhost:8000/process-batch"
+IMAGE_FOLDER = "images/"
+ALLOWED_EXTS = [".jpg", ".jpeg", ".png"]
+RETURN_IMAGES = True
+
+# === Mã hóa ảnh sang base64 ===
+def encode_image(image):
+    _, buffer = cv2.imencode('.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return base64.b64encode(buffer).decode('utf-8') # type: ignore
+
+# === Giải mã base64 về ảnh OpenCV ===
+def decode_image(b64_string):
+    img_bytes = base64.b64decode(b64_string)
+    np_arr = np.frombuffer(img_bytes, np.uint8)
+    return cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+# === Gửi nhiều ảnh trong batch lên REST API ===
+def send_batch(images_b64):
+    payload = {
+        "images": images_b64,
+        "return_images": RETURN_IMAGES
+    }
+    try:
+        response = requests.post(API_URL, json=payload, timeout=60)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            print(f"[ERROR] Status {response.status_code}: {response.text}")
+    except Exception as e:
+        print(f"[EXCEPTION] {e}")
+    return None
+
+# === Đọc tất cả ảnh từ folder và gửi ===
+def main():
+    # Lấy danh sách file ảnh
+    files = [f for f in os.listdir(IMAGE_FOLDER) if os.path.splitext(f)[1].lower() in ALLOWED_EXTS]
+    files.sort()
+    if not files:
+        print("[ERROR] No images found in folder")
         return
 
-    # Cấu hình camera
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    cap.set(cv2.CAP_PROP_FPS, 30)
 
-    try:
-        async with websockets.connect(uri) as websocket:
-            print(f"[CONNECTED] Sending frames to {uri}")
-            
-            frame_count = 0
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    print("[WARNING] Cannot read frame from webcam")
-                    await asyncio.sleep(0.1)
-                    continue
+    images = []
+    filenames = []
+    for filename in files:
+        img_path = os.path.join(IMAGE_FOLDER, filename)
+        image = cv2.imread(img_path)
+        if image is not None:
+            images.append(encode_image(image))
+            filenames.append(filename)
+        else:
+            print(f"[WARNING] Can't read imaged: {img_path}")
 
-                # Resize nếu muốn (ví dụ resize về 640x480 để giảm băng thông)
-                frame = cv2.resize(frame, (640, 480))
-                
-                # Encode frame → JPEG → base64
-                _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                frame_b64 = base64.b64encode(buffer).decode('utf-8') # type: ignore
-                
-                # Gửi JSON chứa trường "image" - ĐÚNG FORMAT
-                payload = json.dumps({"image": frame_b64})
-                await websocket.send(payload)
-                
-                # Nhận phản hồi JSON từ server
-                response = await websocket.recv()
-                
-                try:
-                    data = json.loads(response)
-                except json.JSONDecodeError as e:
-                    print(f"[JSON ERROR] Cannot parse server response: {e}")
-                    await asyncio.sleep(0.01)
-                    continue
-                
-                # Kiểm tra server trả error
-                if not data.get("success", False):
-                    error_msg = data.get("error", "Unknown error")
-                    print(f"[SERVER ERROR] {error_msg}")
-                    await asyncio.sleep(0.01)
-                    continue
-                
-                # Lấy ảnh đã annotate (base64) từ key "image"
-                img_b64 = data.get("image")
-                if not img_b64:
-                    print("[WARNING] No annotated image received from server")
-                    await asyncio.sleep(0.01)
-                    continue
-                
-                try:
-                    # Decode và hiển thị ảnh đã annotate
-                    img_bytes = base64.b64decode(img_b64)
-                    np_arr = np.frombuffer(img_bytes, np.uint8)
-                    annotated = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-                    
-                    if annotated is not None:
-                        # Hiển thị trong cửa sổ OpenCV (để dev debug)
-                        cv2.imshow("Annotated (Server)", annotated)
-                        
-                        # In detections ra console (mỗi 30 frame để tránh spam)
-                        frame_count += 1
-                        if frame_count % 10 == 0:
-                            detections = data.get("detections", [])
-                            metadata = data.get("metadata", {})
-                            
-                            print(f"\n[FRAME {frame_count}] Detections:")
-                            for det in detections:
-                                det_type = det.get('type', 'unknown')
-                                text = det.get('text', 'None')
-                                conf = det.get('confidence', 0.0)
-                                print(f"  - {det_type.upper()}: {text} (conf={conf:.2f})")
-                            
-                            print(f"[METADATA] Plate: {metadata.get('plate', 'None')}, "
-                                  f"Container: {metadata.get('container', 'None')}, "
-                                  f"Face: {metadata.get('face', 'None')}")
-                    
-                except Exception as e:
-                    print(f"[ERROR] Cannot decode annotated image: {e}")
-                
-                # Check for quit (Comment đoạn này khi kết nối Camera)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    print("[INFO] Quit requested by user")
-                    break 
-                
-                # Điều chỉnh FPS (30fps ~ 0.033s, 15fps ~ 0.067s)
-                await asyncio.sleep(0.033)  # ~30 FPS
-                
-    except websockets.exceptions.ConnectionClosed as e:
-        print(f"[ERROR] WebSocket connection closed: {e}")
-    except KeyboardInterrupt:
-        print("[INFO] Interrupted by user")
-    except Exception as e:
-        print(f"[ERROR] Unexpected error: {e}")
-    finally:
-        cap.release()
-        cv2.destroyAllWindows()
-        print("[INFO] Camera released and windows closed")
+    # Gửi batch ảnh
+    result_data = send_batch(images)
+    if not result_data or not result_data.get("results"):
+        print("[ERROR] No responsive from server")
+        return
+
+    results = result_data["results"]
+
+    # Hiển thị kết quả từng ảnh
+    for i, result in enumerate(results):
+        print(f"\n[IMAGE] {filenames[i]}")
+        if result.get("success"):
+            metadata = result.get("metadata", {})
+            detections = result.get("detections", [])
+            print(f"  - Metadata: {metadata}")
+            for det in detections:
+                print(f"    + {det['type'].upper()}: {det['text']} (conf={det['confidence']:.2f})")
+
+            # Hiển thị ảnh annotate nếu có
+            annotated_b64 = result.get("image")
+            if annotated_b64:
+                annotated_img = decode_image(annotated_b64)
+                cv2.imshow(f"Result - {filenames[i]}", annotated_img)
+                key = cv2.waitKey(0)
+                if key == ord('q'):
+                    break
+                cv2.destroyWindow(f"Result - {filenames[i]}")
+        else:
+            print(f"  - [ERROR] {result.get('error', 'Unknown error')}")
+
+    cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    # WebSocket endpoint cho client camera
-    WS_URI = "ws://localhost:8000/ws/combined-detection"
-    
-    print(f"[INFO] Starting camera client...")
-    print(f"[INFO] Connecting to: {WS_URI}")
-    print(f"[INFO] Press 'q' in the OpenCV window to quit")
-    
-    try:
-        asyncio.run(send_frames(WS_URI))
-    except KeyboardInterrupt:
-        print("\n[INFO] Application terminated by user")
-    except Exception as e:
-        print(f"\n[FATAL ERROR] {e}")
+    main()

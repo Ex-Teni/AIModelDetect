@@ -2,6 +2,7 @@ import subprocess
 import time
 import uuid
 import cv2
+from paddleocr import PaddleOCR
 import torch
 import json
 import base64
@@ -10,12 +11,9 @@ import joblib
 import re
 import easyocr
 import threading
-import pytesseract
 import concurrent.futures
 from logging import debug
 from fastapi import Request
-from paddleocr import PaddleOCR
-from transformers import TrOCRProcessor, VisionEncoderDecoderModel
 from fastapi import FastAPI, WebSocket, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,10 +30,8 @@ from dataclasses import dataclass
 
 # ===== GLOBAL VARIABLES =====
 app = FastAPI()
-device = "cuda" if torch.cuda.is_available() else "cpu"
-mtcnn = MTCNN(keep_all=True, device=device)
-
-print(f"Using device: {device}")
+device_cpu = torch.device("cpu")
+device_gpu = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class GlobalState:
     def __init__(self):
@@ -45,7 +41,7 @@ class GlobalState:
         self.models_loaded = False
 
 # Detection thresholds
-FACE_CONFIDENCE_THRESHOLD = 0.95  # Face detection threshold
+FACE_CONFIDENCE_THRESHOLD = 0.3  # Face detection threshold
 OCR_CONFIDENCE_THRESHOLD = 0.3    # OCR confidence threshold
 SEAL_OCR_CONFIDENCE_THRESHOLD = 0.25  # Threshold for seal detection
 
@@ -80,11 +76,12 @@ class ModelManager:
         """Gọi model từ folde modelAI"""
         try:
             print(f"[INFO] Loading all model...")
-            self.yolo_models['plate'] = YOLO("modelAI/detect_PlateNumber.pt")
-            self.yolo_models['container'] = YOLO("modelAI/detect_ContainerCode.pt")
-            self.yolo_models['character'] = YOLO("modelAI/detect_Character.pt")
-            self.face_models['mtcnn'] = MTCNN(keep_all=True, device=device)
-            self.face_models['facenet'] = InceptionResnetV1(pretrained='vggface2').eval().to(device)
+            self.yolo_models['plate'] = YOLO("modelAI/detect_PlateNumber.pt").to(device_cpu)
+            self.yolo_models['container'] = YOLO("modelAI/detect_ContainerCode.pt").to(device_cpu)
+            self.yolo_models['character'] = YOLO("modelAI/detect_Character.pt").to(device_cpu)
+
+            self.face_models['mtcnn'] = MTCNN(keep_all=True, device=device_gpu)
+            self.face_models['facenet'] = InceptionResnetV1(pretrained='vggface2').eval().to(device_gpu)
 
             try: 
                 self.face_classifier = joblib.load('modelAI/face_classifier.joblib')
@@ -134,7 +131,7 @@ class OCRModels:
         try:
             self.paddle_ocr = PaddleOCR(
                 use_angle_cls=True,
-                lang="en",
+                lang="en"
             )
             print("[INFO] PaddleOCR initialized successfully")
 
@@ -142,23 +139,8 @@ class OCRModels:
             print(f"[ERROR] PaddleOCR initialization failed: {e}")
             self.paddle_ocr = None
 
-        self.easy_ocr = easyocr.Reader(['en'], gpu=torch.cuda.is_available())
+        self.easy_ocr = easyocr.Reader(['en'], gpu=True)
 
-        # TrOCR fallback
-        try:
-            self.trocr_processor = TrOCRProcessor.from_pretrained("microsoft/trocr-base-printed")
-            self.trocr_model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-base-printed")
-            print("[INFO] TrOCR models loaded successfully")
-            
-        except Exception as e:
-            self.trocr_processor = None
-            self.trocr_model = None
-            print(f"[WARNING] TrOCR models failed to load: {e}")
-
-        # Tesseract config
-        self.tesseract_cmd = r"C:\Tesseract-OCR\tesseract.exe"
-        self.plate_config = r'--oem 3 --psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'
-        self.container_config = r'--oem 3 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
 
 @dataclass
 class PlateResult:
@@ -188,39 +170,59 @@ def timeout_with_executor(timeout_sec: float):
     return decorator
 
 # ===== TEXT PROCESSING FUNCTIONS =====
+def create_rotation_variants(image: np.ndarray) -> List[np.ndarray]:
+    """
+    Tạo rotation variants cho container text
+    """
+    variants = [image]
+    
+    try:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+        h, w = gray.shape
+        center = (w//2, h//2)
+        
+        # Chỉ tạo rotation nếu cần thiết
+        orientation = detect_text_orientation(image)
+        
+        if orientation == "vertical":
+            for angle in [90, -90]:
+                M = cv2.getRotationMatrix2D(center, angle, 1.0)
+                rotated = cv2.warpAffine(gray, M, (w, h), 
+                                       borderMode=cv2.BORDER_CONSTANT, 
+                                       borderValue=255) # type: ignore
+                variants.append(rotated)
+        
+        return variants
+        
+    except Exception as e:
+        print(f"[ERROR] Rotation variants failed: {e}")
+        return [image]
+    
 def detect_text_orientation(image: np.ndarray) -> str:
     """Phát hiện hướng của text (horizontal/vertical)"""
     try:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
         h, w = gray.shape
         
-        # Tính gradient theo các hướng
+        # Tính gradient theo 2 hướng
         grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
         grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
         
-        # Tính độ mạnh gradient
-        grad_x_strength = np.sum(np.abs(grad_x))
-        grad_y_strength = np.sum(np.abs(grad_y))
+        # Tính strength của edges
+        horizontal_strength = np.mean(np.abs(grad_x))
+        vertical_strength = np.mean(np.abs(grad_y))
         
-        # Phân tích tỷ lệ khung hình
+        # Aspect ratio cũng là indicator
         aspect_ratio = w / h
         
-        if aspect_ratio > 2.5:  
-            return "horizontal"
-        elif aspect_ratio < 0.5: 
+        # Kết hợp cả hai yếu tố
+        if vertical_strength > horizontal_strength * 1.2 or aspect_ratio < 0.5:
             return "vertical"
         else:
-            # Dựa vào gradient
-            if grad_x_strength > grad_y_strength * 1.2:
-                return "vertical"
-            elif grad_y_strength > grad_x_strength * 1.5:
-                return "horizontal"
-            else:
-                # Fallback dựa vào aspect ratio
-                return "horizontal" if aspect_ratio > 1.0 else "vertical"
-                
+            return "horizontal"
+            
     except Exception as e:
-        print(f"[WARN] Orientation detection failed: {e}")
+        print(f"[ERROR] Orientation detection failed: {e}")
         return "horizontal"
 
 # ===== PREPROCESS IMAGE FOR OCR FUNCTIONS =====
@@ -230,33 +232,56 @@ def preprocess_for_plate_text(image: np.ndarray) -> List[np.ndarray]:
     try:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
         h, w = gray.shape
+
+        if h < 60 or w < 200:
+            scale_factor = max(60/h, 200/w, 1.5)
+            new_w, new_h = int(w * scale_factor), int(h * scale_factor)
+            gray = cv2.resize(gray, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+            h, w = new_h, new_w
         
-        # 1. Thiếu sáng: CLAHE + Sharpen
-        clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 4))
+        # 1. Baseline - CLAHE moderate để cải thiện contrast
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 4))
         enhanced = clahe.apply(gray)
-        kernel_sharp = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]])
-        sharpened = cv2.filter2D(enhanced, -1, kernel_sharp)
+        processed_variants.append(enhanced)
+        
+        # 2. Giảm noise + tăng contrast - phù hợp với ảnh có nhiễu
+        # Gaussian blur nhẹ trước khi CLAHE
+        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+        clahe_strong = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(4, 2))
+        enhanced_strong = clahe_strong.apply(blurred)
+        processed_variants.append(enhanced_strong)
+        
+        # 3. Xử lý cho ảnh tối/thiếu sáng (như ảnh 2)
+        # Gamma correction + CLAHE
+        gamma = 1.5  # Tăng độ sáng
+        gamma_corrected = np.power(gray / 255.0, 1.0/gamma) # type: ignore
+        gamma_corrected = np.uint8(gamma_corrected * 255)
+        enhanced_gamma = clahe.apply(gamma_corrected) # type: ignore
+        processed_variants.append(enhanced_gamma)
+        
+        # 4. Sharpening cho text mờ
+        kernel_sharpen = np.array([[-1, -1, -1], 
+                                  [-1, 9, -1], 
+                                  [-1, -1, -1]])
+        sharpened = cv2.filter2D(enhanced, -1, kernel_sharpen)
+        # Clamp values
+        sharpened = np.clip(sharpened, 0, 255).astype(np.uint8)
         processed_variants.append(sharpened)
-
-        # 2. Nhiễu: Denoise + Adaptive Threshold
-        denoised = cv2.fastNlMeansDenoising(gray, None, 15, 7, 21)
-        adaptive = cv2.adaptiveThreshold(denoised, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-                                         cv2.THRESH_BINARY, 21, 10)
-        processed_variants.append(adaptive)
-
-        # 3. Text mờ: Gradient + Adaptive
-        kernel_grad = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        gradient = cv2.morphologyEx(enhanced, cv2.MORPH_GRADIENT, kernel_grad)
-        adaptive2 = cv2.adaptiveThreshold(gradient, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                          cv2.THRESH_BINARY, 25, 11)
-        processed_variants.append(adaptive2)
-
-        # 4. Rõ nét: CLAHE nhẹ
-        clahe_light = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 2))
-        light_enhanced = clahe_light.apply(gray)
-        processed_variants.append(light_enhanced)
-
-        return processed_variants
+        
+        # 5. Morphological operations để kết nối ký tự bị gãy
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+        closed = cv2.morphologyEx(enhanced, cv2.MORPH_CLOSE, kernel_close)
+        processed_variants.append(closed)
+        
+        # 6. Adaptive threshold cho các trường hợp khó
+        adaptive_thresh = cv2.adaptiveThreshold(
+            enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+            cv2.THRESH_BINARY, 15, 8
+        )
+        processed_variants.append(adaptive_thresh)
+        
+        return processed_variants[:6]
+    
     except Exception as e:
         print(f"[ERROR] Plate preprocessing failed: {e}")
         return [gray] if 'gray' in locals() else []
@@ -275,29 +300,40 @@ def preprocess_for_container_text(image: np.ndarray):
             gray = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_LANCZOS4)
             h, w = gray.shape
 
-        # 1. Preprocessing cơ bản - ưu tiên độ tương phản
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 4))
+        # 1. Baseline - CLAHE với tham số phù hợp cho metal texture
+        clahe = cv2.createCLAHE(clipLimit=3.5, tileGridSize=(8, 4))
         enhanced = clahe.apply(gray)
         processed_variants.append(enhanced)
-
-        # 2. Denoise + Adaptive threshold
-        denoised = cv2.fastNlMeansDenoising(gray, None, 15, 7, 21)
-        adaptive = cv2.adaptiveThreshold(denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                         cv2.THRESH_BINARY, 19, 8)
-        processed_variants.append(adaptive)
-
-        # 3. Morphology để kết nối ký tự
-        kernel_rect = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-        morph = cv2.morphologyEx(enhanced, cv2.MORPH_CLOSE, kernel_rect)
-        processed_variants.append(morph)
-
-
-        # 4. Gradient enhancement
+        
+        # 2. Giảm texture noise bằng bilateral filter
+        bilateral = cv2.bilateralFilter(gray, 9, 75, 75)
+        enhanced_bilateral = clahe.apply(bilateral)
+        processed_variants.append(enhanced_bilateral)
+        
+        # 3. Morphological gradient để highlight text edges
         kernel_grad = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         gradient = cv2.morphologyEx(enhanced, cv2.MORPH_GRADIENT, kernel_grad)
         processed_variants.append(gradient)
-
-        return processed_variants
+        
+        # 4. Unsharp masking để tăng độ rõ nét text
+        gaussian = cv2.GaussianBlur(enhanced, (5, 5), 0)
+        unsharp = cv2.addWeighted(enhanced, 1.5, gaussian, -0.5, 0)
+        unsharp = np.clip(unsharp, 0, 255).astype(np.uint8)
+        processed_variants.append(unsharp)
+        
+        # 5. Contrast stretching
+        min_val, max_val = np.percentile(gray, [5, 95]) # type: ignore
+        stretched = np.clip((gray - min_val) * 255 / (max_val - min_val), 0, 255).astype(np.uint8)
+        processed_variants.append(stretched)
+        
+        # 6. Adaptive threshold với parameters phù hợp
+        adaptive = cv2.adaptiveThreshold(
+            enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 21, 10
+        )
+        processed_variants.append(adaptive)
+        
+        return processed_variants[:6]
     except Exception as e:
         print(f"[ERROR] Container preprocessing failed: {e}")
         return [gray] if 'gray' in locals() else []
@@ -308,66 +344,96 @@ def detect_plate_layout(image: np.ndarray) -> Dict[str, any]: # type: ignore
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
         h, w = gray.shape
         
-        # Tìm contours để phát hiện text regions
-        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        # Aspect ratio analysis
+        aspect_ratio = w / h
         
-        # Morphological operations để kết nối các ký tự
-        kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
-        connected = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel_h)
+        # Contour analysis để detect text regions
+        thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        # Tìm contours của các dòng text
-        contours, _ = cv2.findContours(connected, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        # Lọc contours theo kích thước
-        text_regions = []
-        min_area = (w * h) * 0.02  # Tối thiểu 2% diện tích
-        
+        # Lọc contours có thể là text
+        text_contours = []
         for contour in contours:
-            x, y, w_c, h_c = cv2.boundingRect(contour)
-            area = w_c * h_c
+            area = cv2.contourArea(contour)
+            if area > 50:  # Lọc noise
+                x, y, w_c, h_c = cv2.boundingRect(contour)
+                if w_c > 10 and h_c > 10:  # Kích thước hợp lý
+                    text_contours.append((x, y, w_c, h_c))
+        
+        # Phân tích vị trí các text regions
+        if len(text_contours) >= 2:
+            # Sắp xếp theo y
+            text_contours.sort(key=lambda x: x[1])
             
-            if area > min_area and w_c > 30 and h_c > 10:
-                text_regions.append({
-                    'bbox': (x, y, x + w_c, y + h_c),
-                    'area': area,
-                    'center_y': y + h_c // 2,
-                    'center_x': x + w_c // 2, 
-                    'width': w_c,
-                    'height': h_c
-                })
+            # Kiểm tra có text ở nhiều dòng không
+            y_positions = [tc[1] for tc in text_contours]
+            y_diff = max(y_positions) - min(y_positions)
+            
+            # Nếu khoảng cách Y lớn => multiline
+            is_multiline = y_diff > h * 0.3
+        else:
+            # Fallback: dựa vào aspect ratio
+            is_multiline = aspect_ratio < 3.0
         
-        # Sắp xếp theo vị trí Y
-        text_regions.sort(key=lambda x: (x['center_y'], x['center_x']))
-        
-        # Phân tích layout
-        is_multiline = len(text_regions) >= 2
-        aspect_ratio = w / h if h > 0 else 1
-        
-        reading_direction = "left_to_right"
-        if text_regions:
-            # Kiểm tra xem có text regions nào bị đảo ngược không
-            sorted_by_x = sorted(text_regions, key=lambda x: x['center_x'])
-            if sorted_by_x != text_regions:
-                reading_direction = "mixed"
-
         return {
             'is_multiline': is_multiline,
-            'text_regions': text_regions,
+            'reading_direction': 'left_to_right',
             'aspect_ratio': aspect_ratio,
-            'num_regions': len(text_regions),
-            'reading_direction': reading_direction
+            'confidence': 0.8 if len(text_contours) >= 2 else 0.6
         }
-
         
     except Exception as e:
         print(f"[ERROR] Layout detection failed: {e}")
         return {
-            'is_multiline': False, 
-            'text_regions': [], 
-            'aspect_ratio': 1, 
-            'num_regions': 0,
-            'reading_direction': "left_to_right"
+            'is_multiline': False,
+            'reading_direction': 'left_to_right',
+            'aspect_ratio': 1.0,
+            'confidence': 0.3
         }    
+
+def format_vietnam_plate(text: str) -> Optional[str]:
+    """
+    Format theo chuẩn biển số Việt Nam: 2 số + 1-2 chữ + 4-6 số
+    """
+    if not text or len(text) < 6:
+        return None
+    
+    # Mapping để sửa lỗi OCR
+    to_digit = {'O': '0', 'D': '0', 'Q': '0', 'B': '8', 'S': '5', 'Z': '2', 'G': '6', 'I': '1', 'L': '1'}
+    to_letter = {'0': 'O', '1': 'I', '2': 'Z', '5': 'S', '6': 'G', '8': 'B'}
+    
+    chars = list(text)
+    
+    # 2 ký tự đầu phải là số (mã tỉnh)
+    for i in range(min(2, len(chars))):
+        if chars[i] in to_digit:
+            chars[i] = to_digit[chars[i]]
+    
+    # Ký tự thứ 3 phải là chữ (loại xe)
+    if len(chars) >= 3 and chars[2] in to_letter:
+        chars[2] = to_letter[chars[2]]
+    
+    # Ký tự thứ 4 có thể là chữ (trong trường hợp 2 chữ)
+    if len(chars) >= 4 and not chars[3].isdigit():
+        if chars[3] in to_letter:
+            chars[3] = to_letter[chars[3]]
+        # Nếu không phải chữ hợp lệ, coi như số
+        elif chars[3] in to_digit:
+            chars[3] = to_digit[chars[3]]
+    
+    # Các ký tự còn lại phải là số
+    start_idx = 4 if len(chars) >= 4 and chars[3].isalpha() else 3
+    for i in range(start_idx, len(chars)):
+        if chars[i] in to_digit:
+            chars[i] = to_digit[chars[i]]
+    
+    result = ''.join(chars)
+    
+    # Kiểm tra format hợp lệ
+    if re.match(r'^\d{2}[A-Z]\d{4,6}$', result) or re.match(r'^\d{2}[A-Z]{2}\d{4,6}$', result):
+        return result
+    
+    return result if 6 <= len(result) <= 10 else None
 
 def clean_plate_text(text: str, is_multiline: bool = False) -> Optional[str]:
     """Cải tiến text cleaning cho biển số xe"""
@@ -390,87 +456,22 @@ def clean_plate_text(text: str, is_multiline: bool = False) -> Optional[str]:
     
     for wrong, correct in ocr_corrections.items():
         text = text.replace(wrong, correct)
-    def is_likely_reversed(text_part):
-        """Kiểm tra xem text có khả năng bị đảo ngược không"""
-        if len(text_part) < 4:
-            return False
-        
-        # Kiểm tra pattern: nếu bắt đầu bằng nhiều số thì có thể bị đảo
-        digit_start = sum(1 for c in text_part[:3] if c.isdigit())
-        digit_end = sum(1 for c in text_part[-3:] if c.isdigit())
-        
-        # Pattern Vietnam plate: thường bắt đầu bằng số (mã tỉnh) sau đó chữ
-        # Nếu cuối có nhiều số hơn đầu thì có thể bị đảo
-        if digit_end > digit_start and digit_end >= 2:
-            return True
-        return False
-    
-    def fix_reversed_text(text_part):
-        """Sửa text bị đảo ngược"""
-        return text_part[::-1]
 
+    # Xử lý multiline
     if is_multiline:
-        # Xử lý biển số 2 dòng
-        lines = []
-        for line in text.split('\n'):
-            line = line.strip()
-            if line:
-                # Làm sạch từng dòng
-                cleaned_line = re.sub(r'[^A-Z0-9]', '', line)
-                if is_likely_reversed(cleaned_line):
-                    cleaned_line = fix_reversed_text(cleaned_line)
-                    print(f"[FIX] Detect reversed and fixed: {cleaned_line}")
-                if len(cleaned_line) >= 2:  # Tối thiểu 2 ký tự mỗi dòng
-                    lines.append(cleaned_line)
-        
+        lines = [line.strip() for line in text.split('-') if line.strip()]
         if len(lines) >= 2:
-            # Ghép với dấu gạch ngang
-            combined = f"{lines[0]}-{lines[1]}"
-            if len(combined) >= 5:  # Tối thiểu 5 ký tự (2-1-2)
-                return combined
-        elif len(lines) == 1 and len(lines[0]) >= 4:
-            # Trường hợp detect 1 dòng nhưng thực tế là 2 dòng
-            line = lines[0]
-
-            if is_likely_reversed(line):
-                line = fix_reversed_text(line)
-                print(f"[FIX] Reversed combined line detected and fixed: {line}")
-
-            if len(line) >= 6:  # Đủ để tách thành 2 phần
-                for split_pos in [2, 3]:
-                    if split_pos < len(line):
-                        part1 = line[:split_pos]
-                        part2 = line[split_pos:]
-
-                        if part1.isdigit() and len(part2) >= 4:
-                            return f"{part1}-{part2}"
-                        elif len(part2) >= 2 and part2.isdigit() and len(part2) >= 4:
-                            return f"{part1}-{part2}"
-                        
-                mid = len(line) // 2
-                part1 = line[:mid]
-                part2 = line[mid:]
-                return f"{part1}-{part2}"
-            return line
-        
-        # Fallback: ghép tất cả
-        combined = ''.join(lines)
-        if len(combined) >= 4:
-            return combined
-    
+            combined = ''.join(lines)
+        elif len(lines) == 1:
+            combined = lines[0]
+        else:
+            combined = text.replace('-', '')
     else:
-        # Xử lý biển số 1 dòng
-        cleaned = re.sub(r'[^A-Z0-9\-]', '', text)
-
-        if is_likely_reversed(cleaned):
-            cleaned = fix_reversed_text(cleaned)
-            print(f"[FIX] Reversed single line detected and fixed: {text} -> {cleaned}")
-
-        # Validate format cơ bản
-        if len(cleaned) >= 4 and len(cleaned) <= 15:  # Độ dài hợp lý
-            return cleaned
+        combined = text.replace('-', '')
     
-    return None
+    # Áp dụng format chuẩn biển số Việt Nam
+    return format_vietnam_plate(combined)
+
 
 def clean_container_text(text: str) -> Optional[str]:
     """Xử lý text container code dọc"""
@@ -487,36 +488,43 @@ def clean_container_text(text: str) -> Optional[str]:
         '@': '8', '?': '7', '%': '8'
     }
 
-    for wrong, correct in corrections.items():
-        text = text.replace(wrong, correct)
+    # Tách chữ và số
+    letters = ''.join([c for c in text if c.isalpha()])
+    numbers = ''.join([c for c in text if c.isdigit()])
     
-    # Kiểm tra và sửa lỗi đảo ngược
-    if len(text) >= 8:
-        # Pattern 1: số + chữ --> chữ + số
-        match_num_letters = re.match(r'^(\d{6,7})([A-Z]{4})$', text)
-        if match_num_letters:
-            numbers, letters = match_num_letters.groups()
-            corrected = letters + numbers
-            print(f"[FIX] Reversed pattern detected: {text} -> {corrected}")
-            return corrected
+    # Format chuẩn container: 4 chữ + 7 số
+    if len(letters) >= 4 and len(numbers) >= 6:
+        # 4 ký tự đầu là chữ
+        letter_part = letters[:4]
+        # Sửa lỗi OCR cho phần chữ
+        letter_corrected = ''
+        for char in letter_part:
+            if char.isdigit():
+                # Chuyển số thành chữ
+                digit_to_letter = {'0': 'O', '1': 'I', '2': 'Z', '5': 'S', '6': 'G', '8': 'B'}
+                letter_corrected += digit_to_letter.get(char, char)
+            else:
+                letter_corrected += char
         
-        # Pattern 2: Chữ + Số (đúng)
-        match_letters_num = re.match(r'^([A-Z]{4})(\d{6,7})$', text)
-        if match_letters_num:
-            return text
-            
-        # Pattern 3: Mixed characters - tách và sắp xếp lại
-        letters = ''.join([c for c in text if c.isalpha()])
-        numbers = ''.join([c for c in text if c.isdigit()])
+        # Phần số (lấy 6-7 ký tự)
+        number_part = numbers[:7] if len(numbers) >= 7 else numbers
+        # Sửa lỗi OCR cho phần số
+        number_corrected = ''
+        for char in number_part:
+            if char.isalpha():
+                number_corrected += corrections.get(char, char)
+            else:
+                number_corrected += char
         
-        if len(letters) == 4 and len(numbers) >= 6:
-            return letters + numbers
-    
-    # Fallback validation
-    if len(text) >= 6:
-        return text
-    
-    return None
+        result = letter_corrected + number_corrected
+        result = result[:10]
+
+        # Kiểm tra format cuối cùng
+        if len(result) >= 10 and re.match(r'^[A-Z]{4}\d{6,7}$', result):
+            return result
+        
+    text = text[:10]
+    return text if len(text) >= 6 else None
 
 @timeout_with_executor(OCR_TIMEOUT)
 def extract_text_plate(image_crop: np.ndarray, ocr_models) -> Tuple[Optional[str], float]:
@@ -593,6 +601,11 @@ def extract_text_plate(image_crop: np.ndarray, ocr_models) -> Tuple[Optional[str
                                     # Tách lại thành các list riêng biệt
                                     texts = [item[0] for item in combined_data]
                                     confidences = [item[1] for item in combined_data]
+
+                                    if is_multiline and len(texts) > 1:
+                                        combined_text = '\n'.join(texts)
+                                    else:
+                                        combined_text = ''.join(texts)
                     
                             
                             # Trường hợp 1b: first_result là tuple (text, confidence)
@@ -701,23 +714,6 @@ def extract_text_plate(image_crop: np.ndarray, ocr_models) -> Tuple[Optional[str
 
             except Exception as e:
                 print(f"[ERROR] EasyOCR variant {variant_idx} failed: {e}")
-
-            # Try Tesseract
-            try:
-                tesseract_configs = [
-                    '--oem 3 --psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-',
-                    '--oem 3 --psm 4 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-',
-                    '--oem 3 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'
-                ]
-                for config_idx, config in enumerate(tesseract_configs):
-                    text = pytesseract.image_to_string(processed_img, config=config).strip()
-                    if text:
-                        cleaned = clean_plate_text(text, is_multiline)
-                        if cleaned:
-                            conf = 0.6 if config_idx == 0 else 0.5
-                            ocr_attempts.append((cleaned, conf, f"Tesseract_v{variant_idx}_c{config_idx}"))
-            except Exception as e:
-                print(f"[ERROR] Tesseract variant {variant_idx} failed: {e}")
 
             # Append best attempt
             if ocr_attempts:
@@ -835,7 +831,7 @@ def extract_text_container(image_crop: np.ndarray, ocr_models: OCRModels) -> Tup
                                     first = sorted(first, key=lambda x: (sum([p[1] for p in x[0]]) / 4, sum([p[0] for p in x[0]]) / 4))
                                 else:
                                     # Sắp xếp theo x (trái sang phải)
-                                    first = sorted(first, key=lambda x: (sum([p[1] for p in x[0]]) / 4, sum([p[0] for p in x[0]]) / 4))
+                                    first = sorted(first, key=lambda x: (sum([p[0] for p in x[0]]) / 4, sum([p[1] for p in x[0]]) / 4))
                             except Exception:
                                 pass
 
@@ -930,32 +926,6 @@ def extract_text_container(image_crop: np.ndarray, ocr_models: OCRModels) -> Tup
                 except Exception as e:
                     print(f"[ERROR] EasyOCR container variant {variant_idx} failed: {e}")
 
-            # ===== Tesseract =====
-            try:
-                configs = [
-                    '--oem 3 --psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
-                    '--oem 3 --psm 4 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
-                    '--oem 3 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-                ]
-                for c_idx, config in enumerate(configs):
-                    text = pytesseract.image_to_string(processed_img, config=config).strip()
-                    cleaned = clean_container_text(text)
-                    if cleaned:
-                        conf = 0.75 if variant_idx < 3 else 0.6
-                        ocr_attempts.append((cleaned, conf, f"Tesseract_v{variant_idx}_c{c_idx}"))
-            except Exception as e:
-                print(f"[ERROR] Tesseract variant {variant_idx} failed: {e}")
-
-            if ocr_attempts:
-                best = max(ocr_attempts, key=lambda x: x[1])
-                if best[1] > 0.3:
-                    bonus = 0.05 if variant_idx < 4 else 0
-                    final_conf = min(best[1] + bonus, 1.0)
-                    all_results.append(ContainerResult(
-                        text=best[0],
-                        confidence=final_conf,
-                        method=best[2]
-                    ))
 
         # ===== Voting =====
         if len(all_results) >= 2:
@@ -1127,6 +1097,8 @@ def detect_faces(frame):
     results = []
     try:
         img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        mtcnn = model_manager.face_models['mtcnn']
         boxes, probs = mtcnn.detect(img_rgb) # type: ignore
 
         if boxes is None or len(boxes) == 0:
@@ -1148,7 +1120,7 @@ def detect_faces(frame):
             # Extract face and get embedding
             face_crop = img_rgb[y1c:y2c, x1c:x2c]
             face_pil = Image.fromarray(face_crop)
-            face_tensor = face_transform(face_pil).unsqueeze(0).to(device) # type: ignore
+            face_tensor = model_manager.face_transform(face_pil).unsqueeze(0).to(device) # type: ignore
 
             with torch.no_grad():
                 embedding = model_manager.face_models['facenet'](face_tensor).cpu().numpy()
@@ -1158,7 +1130,11 @@ def detect_faces(frame):
             best_idx = np.argmax(proba_list)
             best_prob = float(proba_list[best_idx])
             
-            name = model_manager.label_encoder.inverse_transform([best_idx])[0] if best_prob >= FACE_CONFIDENCE_THRESHOLD else None
+            if best_prob >= FACE_CONFIDENCE_THRESHOLD:
+                name = model_manager.label_encoder.inverse_transform([best_idx])[0]
+            else:
+                name = "Unknown"
+
 
             results.append({
                 "type": "face",
@@ -1235,18 +1211,14 @@ def process_image(frame):
 def extract_metadata(detections: List[Dict[str, Any]]) -> Dict[str, str]:
     """Extract metadata from detections"""
     metadata = {"plate": "None", "container": "None", "face": "None", "seal": "None"}
-
-    if debug:
-        print(f"[DEBUG] Input detections: {detections}")
     
     for det in detections:
         det_type = det["type"]
         text = det.get("text", None)
         
-        if text is not None and text != "None":
-            if debug:
-                print(f"[DEBUG] Setting {det_type} = {text}")
+        if text is not None and str(text).lower() != "none":
             metadata[det_type] = text
+
     
     return metadata
 
@@ -1282,7 +1254,6 @@ def health_check():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "device": device,
         "models_loaded": global_state.models_loaded,
         "models": {
             "yolo_plate": model_manager.yolo_models.get('plate') is not None,
