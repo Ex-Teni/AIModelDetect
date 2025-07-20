@@ -78,7 +78,6 @@ class ModelManager:
             print(f"[INFO] Loading all model...")
             self.yolo_models['plate'] = YOLO("modelAI/detect_PlateNumber.pt").to(device_cpu)
             self.yolo_models['container'] = YOLO("modelAI/detect_ContainerCode.pt").to(device_cpu)
-            self.yolo_models['character'] = YOLO("modelAI/detect_Character.pt").to(device_cpu)
 
             self.face_models['mtcnn'] = MTCNN(keep_all=True, device=device_gpu)
             self.face_models['facenet'] = InceptionResnetV1(pretrained='vggface2').eval().to(device_gpu)
@@ -91,6 +90,13 @@ class ModelManager:
                 print(f"[WARNING] Face classifier not found: {e}")
                 self.face_classifier = None
                 self.label_encoder = None
+
+            try:
+                self.yolo_models['container'] = YOLO("modelAI/detect_ContainerCode.pt")
+                print("[INFO] Container model loaded successfully.")
+            except Exception as e:
+                print(f"[ERROR] Failed to load container model: {e}")
+                self.yolo_models['container'] = None  
 
             self.face_transform = transforms.Compose([
                 transforms.Resize((160, 160)),
@@ -294,46 +300,56 @@ def preprocess_for_container_text(image: np.ndarray):
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
         h, w = gray.shape
 
-        min_width, min_height = 300, 120  # Tăng kích thước tối thiểu
+        # Tăng kích thước tối thiểu để OCR đọc rõ hơn
+        min_width, min_height = 400, 150  
         if h < min_height or w < min_width:
-            scale = max(min_width / w, min_height / h, 2.0)
+            scale = max(min_width / w, min_height / h, 2.5)  # Tăng scale factor
             gray = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_LANCZOS4)
             h, w = gray.shape
 
-        # 1. Baseline - CLAHE với tham số phù hợp cho metal texture
-        clahe = cv2.createCLAHE(clipLimit=3.5, tileGridSize=(8, 4))
+        # 1. Baseline với CLAHE mạnh hơn
+        clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(4, 2))  # Tăng clipLimit
         enhanced = clahe.apply(gray)
         processed_variants.append(enhanced)
         
-        # 2. Giảm texture noise bằng bilateral filter
-        bilateral = cv2.bilateralFilter(gray, 9, 75, 75)
-        enhanced_bilateral = clahe.apply(bilateral)
+        # 2. Bilateral filter + contrast enhancement
+        bilateral = cv2.bilateralFilter(gray, 9, 80, 80)
+        # Tăng contrast thêm bằng histogram stretching
+        p2, p98 = np.percentile(bilateral, (2, 98))
+        bilateral_stretched = np.clip((bilateral - p2) * 255.0 / (p98 - p2), 0, 255).astype(np.uint8)
+        enhanced_bilateral = clahe.apply(bilateral_stretched)
         processed_variants.append(enhanced_bilateral)
         
-        # 3. Morphological gradient để highlight text edges
-        kernel_grad = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        gradient = cv2.morphologyEx(enhanced, cv2.MORPH_GRADIENT, kernel_grad)
-        processed_variants.append(gradient)
+        # 3. Morphological operations để làm rõ text
+        kernel_rect = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        # Opening để loại bỏ noise
+        opened = cv2.morphologyEx(enhanced, cv2.MORPH_OPEN, kernel_rect)
+        # Closing để kết nối text bị gãy
+        closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel_rect)
+        processed_variants.append(closed)
         
-        # 4. Unsharp masking để tăng độ rõ nét text
-        gaussian = cv2.GaussianBlur(enhanced, (5, 5), 0)
-        unsharp = cv2.addWeighted(enhanced, 1.5, gaussian, -0.5, 0)
+        # 4. Unsharp masking mạnh hơn
+        gaussian = cv2.GaussianBlur(enhanced, (3, 3), 0)
+        unsharp = cv2.addWeighted(enhanced, 2.0, gaussian, -1.0, 0)  # Tăng weight
         unsharp = np.clip(unsharp, 0, 255).astype(np.uint8)
         processed_variants.append(unsharp)
         
-        # 5. Contrast stretching
-        min_val, max_val = np.percentile(gray, [5, 95]) # type: ignore
-        stretched = np.clip((gray - min_val) * 255 / (max_val - min_val), 0, 255).astype(np.uint8)
-        processed_variants.append(stretched)
-        
-        # 6. Adaptive threshold với parameters phù hợp
-        adaptive = cv2.adaptiveThreshold(
+        # 5. Adaptive threshold với nhiều variant
+        # Variant 1: Gaussian adaptive
+        adaptive1 = cv2.adaptiveThreshold(
             enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY, 21, 10
+            cv2.THRESH_BINARY, 15, 8
         )
-        processed_variants.append(adaptive)
+        processed_variants.append(adaptive1)
         
-        return processed_variants[:6]
+        # Variant 2: Mean adaptive
+        adaptive2 = cv2.adaptiveThreshold(
+            enhanced, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+            cv2.THRESH_BINARY, 19, 10
+        )
+        processed_variants.append(adaptive2)
+        
+        return processed_variants
     except Exception as e:
         print(f"[ERROR] Container preprocessing failed: {e}")
         return [gray] if 'gray' in locals() else []
@@ -441,7 +457,7 @@ def clean_plate_text(text: str, is_multiline: bool = False) -> Optional[str]:
         return None
     
     # Loại bỏ ký tự đặc biệt và chuẩn hóa
-    text = re.sub(r'[^\w\s\-\.\/]', '', text.upper().strip())
+    text = re.sub(r'[^\w]', '', text.upper().strip())
     
     # Sửa lỗi OCR
     ocr_corrections = {
@@ -488,43 +504,77 @@ def clean_container_text(text: str) -> Optional[str]:
         '@': '8', '?': '7', '%': '8'
     }
 
-    # Tách chữ và số
-    letters = ''.join([c for c in text if c.isalpha()])
-    numbers = ''.join([c for c in text if c.isdigit()])
+    # # Tách chữ và số
+    # letters = ''.join([c for c in text if c.isalpha()])
+    # numbers = ''.join([c for c in text if c.isdigit()])
     
-    # Format chuẩn container: 4 chữ + 7 số
-    if len(letters) >= 4 and len(numbers) >= 6:
-        # 4 ký tự đầu là chữ
-        letter_part = letters[:4]
+    # # Format chuẩn container: 4 chữ + 7 số
+    # if len(letters) >= 4 and len(numbers) >= 6:
+    #     # 4 ký tự đầu là chữ
+    #     letter_part = letters[:4]
+    #     # Sửa lỗi OCR cho phần chữ
+    #     letter_corrected = ''
+    #     for char in letter_part:
+    #         if char.isdigit():
+    #             # Chuyển số thành chữ
+    #             digit_to_letter = {'0': 'O', '1': 'I', '2': 'Z', '5': 'S', '6': 'G', '8': 'B'}
+    #             letter_corrected += digit_to_letter.get(char, char)
+    #         else:
+    #             letter_corrected += char
+        
+    #     # Phần số (lấy 6-7 ký tự)
+    #     number_part = numbers[:7] if len(numbers) >= 7 else numbers
+    #     # Sửa lỗi OCR cho phần số
+    #     number_corrected = ''
+    #     for char in number_part:
+    #         if char.isalpha():
+    #             number_corrected += corrections.get(char, char)
+    #         else:
+    #             number_corrected += char
+        
+    #     result = letter_corrected + number_corrected
+    #     result = result[:10]
+
+    #     # Kiểm tra format cuối cùng
+    #     if len(result) >= 10 and re.match(r'^[A-Z]{4}\d{6,7}$', result):
+    #         return result
+        
+    # text = text[:10]
+    # return text if len(text) >= 6 else None
+
+    if len(text) >= 10:
+        # 4 ký tự đầu phải là chữ
+        letter_part = text[:4]
+        number_part = text[4:]
+        
         # Sửa lỗi OCR cho phần chữ
-        letter_corrected = ''
+        corrected_letters = ''
         for char in letter_part:
             if char.isdigit():
-                # Chuyển số thành chữ
                 digit_to_letter = {'0': 'O', '1': 'I', '2': 'Z', '5': 'S', '6': 'G', '8': 'B'}
-                letter_corrected += digit_to_letter.get(char, char)
+                corrected_letters += digit_to_letter.get(char, char)
             else:
-                letter_corrected += char
+                corrected_letters += char
         
-        # Phần số (lấy 6-7 ký tự)
-        number_part = numbers[:7] if len(numbers) >= 7 else numbers
-        # Sửa lỗi OCR cho phần số
-        number_corrected = ''
-        for char in number_part:
+        # Sửa lỗi OCR cho phần số (lấy 6-7 ký tự)
+        corrected_numbers = ''
+        for char in number_part[:7]:
             if char.isalpha():
-                number_corrected += corrections.get(char, char)
+                corrected_numbers += corrections.get(char, '0')
             else:
-                number_corrected += char
+                corrected_numbers += char
         
-        result = letter_corrected + number_corrected
-        result = result[:10]
-
+        result = corrected_letters + corrected_numbers
+        
         # Kiểm tra format cuối cùng
-        if len(result) >= 10 and re.match(r'^[A-Z]{4}\d{6,7}$', result):
+        if re.match(r'^[A-Z]{4}\d{6,7}$', result):
             return result
-        
-    text = text[:10]
-    return text if len(text) >= 6 else None
+    
+    # Fallback: làm sạch basic
+    if len(text) >= 8:
+        return text[:11]  # Giới hạn độ dài
+    
+    return None
 
 @timeout_with_executor(OCR_TIMEOUT)
 def extract_text_plate(image_crop: np.ndarray, ocr_models) -> Tuple[Optional[str], float]:
@@ -800,10 +850,20 @@ def extract_text_container(image_crop: np.ndarray, ocr_models: OCRModels) -> Tup
             gray = cv2.cvtColor(image_crop, cv2.COLOR_BGR2GRAY) if len(image_crop.shape) == 3 else image_crop
             h, w = gray.shape
             
-            for angle in [90, -90]:
+            for angle in [90, -90, 180]:  # Thêm 180 độ
                 center = (w//2, h//2)
                 rotation_matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
-                rotated = cv2.warpAffine(gray, rotation_matrix, (w, h), borderValue=255) # type: ignore
+                # Tính toán kích thước mới sau rotation
+                cos_angle = abs(rotation_matrix[0, 0])
+                sin_angle = abs(rotation_matrix[0, 1])
+                new_w = int((h * sin_angle) + (w * cos_angle))
+                new_h = int((h * cos_angle) + (w * sin_angle))
+                
+                # Điều chỉnh translation
+                rotation_matrix[0, 2] += (new_w / 2) - center[0]
+                rotation_matrix[1, 2] += (new_h / 2) - center[1]
+                
+                rotated = cv2.warpAffine(gray, rotation_matrix, (new_w, new_h), borderValue=255)
                 processed_images.append(rotated)
         
         # ===== OCR METHODS =====
@@ -817,7 +877,13 @@ def extract_text_container(image_crop: np.ndarray, ocr_models: OCRModels) -> Tup
                     if len(processed_img.shape) == 2:
                         processed_img = cv2.cvtColor(processed_img, cv2.COLOR_GRAY2BGR)
 
-                    paddle_res = ocr_models.paddle_ocr.ocr(processed_img)
+                    paddle_res = ocr_models.paddle_ocr.ocr(
+                        processed_img,
+                        cls=True,  # Bật text direction classification
+                        rec=True,  # Bật text recognition
+                        det=True   # Bật text detection
+                        )
+                    
                     texts, confs = [], []
 
                     if isinstance(paddle_res, list) and len(paddle_res) > 0:
@@ -825,62 +891,83 @@ def extract_text_container(image_crop: np.ndarray, ocr_models: OCRModels) -> Tup
 
                         # Trường hợp list các dòng text
                         if isinstance(first, list):
+                            # Sắp xếp theo vị trí (quan trọng cho container code)
                             try:
                                 if orientation == "vertical":
-                                    # Sắp xếp theo y (trên xuống dưới)
-                                    first = sorted(first, key=lambda x: (sum([p[1] for p in x[0]]) / 4, sum([p[0] for p in x[0]]) / 4))
+                                    # Sắp xếp từ trên xuống dưới, trái sang phải
+                                    first = sorted(first, key=lambda x: (
+                                        min([p[1] for p in x[0]]),  # Y coordinate (top)
+                                        min([p[0] for p in x[0]])   # X coordinate (left)
+                                    ))
                                 else:
-                                    # Sắp xếp theo x (trái sang phải)
-                                    first = sorted(first, key=lambda x: (sum([p[0] for p in x[0]]) / 4, sum([p[1] for p in x[0]]) / 4))
+                                    # Sắp xếp từ trái sang phải, trên xuống dưới
+                                    first = sorted(first, key=lambda x: (
+                                        min([p[0] for p in x[0]]),  # X coordinate
+                                        min([p[1] for p in x[0]])   # Y coordinate
+                                    ))
                             except Exception:
                                 pass
 
-                            for line in first:
+                            for line_idx, line in enumerate(first):
                                 try:
                                     if isinstance(line, list) and len(line) >= 2:
                                         text_info = line[1]
                                         if isinstance(text_info, tuple) and len(text_info) >= 2:
                                             text, conf = text_info[0], text_info[1]
-                                            if text and isinstance(text, str):
-                                                texts.append(text.strip())
-                                                confs.append(float(conf))
-                                        elif isinstance(text_info, str):
-                                            texts.append(text_info.strip())
-                                            confs.append(0.5)
+                                            if text and isinstance(text, str) and len(text.strip()) > 0:
+                                                cleaned_text = re.sub(r'[^A-Z0-9]', '', text.upper().strip())
+                                                if len(cleaned_text) >= 3:  # Lọc text quá ngắn
+                                                    texts.append(cleaned_text)
+                                                    confs.append(float(conf))
+                                                    print(f"[DEBUG] PaddleOCR line {line_idx}: '{cleaned_text}' (conf: {conf:.3f})")
+                                        elif isinstance(text_info, str) and len(text_info.strip()) > 0:
+                                            cleaned_text = re.sub(r'[^A-Z0-9]', '', text_info.upper().strip())
+                                            if len(cleaned_text) >= 3:
+                                                texts.append(cleaned_text)
+                                                confs.append(0.5)
+                                                print(f"[DEBUG] PaddleOCR line {line_idx}: '{cleaned_text}' (default conf)")
                                 except Exception as e:
-                                    print(f"[WARN] Skipping malformed line: {e}")
-
-                        # Trường hợp tuple
-                        elif isinstance(first, tuple) and len(first) >= 2:
-                            text, conf = first
-                            if text and isinstance(text, str):
-                                texts.append(text.strip())
-                                confs.append(float(conf))
-
-                        # Trường hợp string
-                        elif isinstance(first, str):
-                            texts.append(first.strip())
-                            confs.append(0.5)
-
-                        # Trường hợp dict có rec_texts / rec_scores
-                        elif isinstance(first, dict):
-                            try:
-                                raw_texts = first.get('rec_texts', [])
-                                raw_scores = first.get('rec_scores', [])
-                                if raw_texts and raw_scores:
-                                    texts = [t.strip() for t in raw_texts if isinstance(t, str)]
-                                    confs = [float(s) for s in raw_scores]
-                            except Exception as parse_e:
-                                print(f"[WARN] Failed to parse dict: {parse_e}")
+                                    print(f"[WARN] Skipping malformed line {line_idx}: {e}")
 
                     if texts and confs:
-                        combined = ''.join(texts)
-                        avg_conf = sum(confs) / len(confs)
-                        cleaned = clean_container_text(combined)
-                        if cleaned:
-                            ocr_attempts.append((cleaned, avg_conf, f"PaddleOCR_v{variant_idx}"))
+                        # Thử nhiều cách kết hợp text
+                        combinations = []
+                        
+                        # 1. Kết hợp tất cả text
+                        combined_all = ''.join(texts)
+                        if len(combined_all) >= 6:
+                            combinations.append((combined_all, sum(confs) / len(confs)))
+                        
+                        # 2. Lấy text có confidence cao nhất
+                        if texts:
+                            max_conf_idx = confs.index(max(confs))
+                            best_text = texts[max_conf_idx]
+                            if len(best_text) >= 6:
+                                combinations.append((best_text, confs[max_conf_idx]))
+                        
+                        # 3. Kết hợp 2 text đầu tiên (thường là code chính)
+                        if len(texts) >= 2:
+                            combined_two = texts[0] + texts[1]
+                            if len(combined_two) >= 6:
+                                avg_conf = (confs[0] + confs[1]) / 2
+                                combinations.append((combined_two, avg_conf))
+                        
+                        # Thử clean và validate từng combination
+                        for text_combo, combo_conf in combinations:
+                            cleaned = clean_container_text(text_combo)
+                            if cleaned and combo_conf > 0.2:  # Giảm threshold
+                                result = ContainerResult(
+                                    text=cleaned,
+                                    confidence=combo_conf,
+                                    method=f"PaddleOCR_v{variant_idx}"
+                                )
+                                all_results.append(result)
+                                print(f"[SUCCESS] PaddleOCR variant {variant_idx}: {cleaned} (conf: {combo_conf:.3f})")
+                        
+                        if not combinations:
+                            print(f"[INFO] PaddleOCR variant {variant_idx}: No valid combinations found")
                     else:
-                        print(f"[INFO] PaddleOCR container variant {variant_idx} returned no valid text")
+                        print(f"[INFO] PaddleOCR variant {variant_idx}: No valid text extracted")
 
                 except Exception as e:
                     print(f"[ERROR] PaddleOCR variant {variant_idx} failed: {e}")

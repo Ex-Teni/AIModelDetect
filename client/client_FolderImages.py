@@ -1,101 +1,79 @@
 import os
-import cv2
-import json
-import base64
-import argparse
 import requests
-from time import time, sleep
+import cv2
+import numpy as np
+import base64
+import matplotlib.pyplot as plt
 
-def encode_image(image_path: str) -> str:
-    img = cv2.imread(image_path)
-    if img is None:
-        raise ValueError(f"Cannot read image: {image_path}")
-    _, buffer = cv2.imencode(".jpg", img)
-    return base64.b64encode(buffer).decode() # type: ignore
+API_URL = "http://localhost:8000/process-batch"
+FOLDER_PATH = "images/"  
 
-def send_image_rest(api_url: str, img_b64: str) -> dict:
-    payload = {"images": [img_b64]}
-    try:
-        response = requests.post(api_url, json=payload, timeout=120)
-        if response.ok:
-            return response.json()
-        else:
-            return {"success": False, "error": f"HTTP {response.status_code}: {response.text}"}
-    except requests.exceptions.Timeout:
-        return {"success": False, "error": "Request timeout"}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+def send_image_to_api(image_path):
+    with open(image_path, "rb") as f:
+        img_bytes = f.read()
+        img_b64 = base64.b64encode(img_bytes).decode("utf-8")
 
-def draw_detections(image, detections):
-    colors = {
-        "plate": (0, 255, 0),
-        "container": (255, 0, 0),
-        "face": (0, 0, 255),
-        "seal": (255, 255, 0)
+    payload = {
+        "images": [img_b64]
     }
-    for det in detections:
-        x1, y1, x2, y2 = det.get("box", [0, 0, 0, 0])
-        det_type = det.get("type", "unknown")
-        text = det.get("text", "None")
-        color = colors.get(det_type, (255, 255, 255))
+
+    try:
+        response = requests.post(API_URL, json=payload)
+        if response.status_code == 200:
+            result = response.json()
+            if result.get("success") and result.get("results"):
+                return result["results"][0]  # Chỉ gửi 1 ảnh, lấy kết quả đầu
+        else:
+            print(f"[ERROR] API returned status {response.status_code}")
+    except Exception as e:
+        print(f"[EXCEPTION] {e}")
+    return None
+
+def draw_results(image_path, results):
+    image = cv2.imread(image_path)
+    if image is None or not results or "detections" not in results:
+        return image
+
+    for det in results["detections"]:
+        box = det["box"]
+        text = det.get("text", "")
+        conf = det.get("confidence", 0)
+
+        x1, y1, x2, y2 = map(int, box)
+        color = (0, 255, 0)
         cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
-        label = f"{det_type}: {text}"
-        cv2.putText(image, label, (x1, max(y1 - 10, 10)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+        label = f"{det['type'].upper()}: {text} ({conf:.2f})"
+        cv2.putText(image, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
     return image
 
-def main(folder_path: str, api_url: str, delay_between_images: float = 0.2):
-    if not os.path.exists(folder_path):
-        print(f"[ERROR] Folder not found: {folder_path}")
+def show_image(image, title="Annotated Result"):
+    if image is None:
+        print("[WARNING] Cannot display empty image")
         return
+    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    plt.imshow(rgb)
+    plt.title(title)
+    plt.axis('off')
+    plt.pause(2)  
+    plt.close()
 
-    image_files = sorted([
-        f for f in os.listdir(folder_path)
-        if f.lower().endswith(('.jpg', '.jpeg', '.png'))
-    ])
-    print(f"[INFO] Found {len(image_files)} images. Sending one by one via REST...")
+def main():
+    image_files = [f for f in os.listdir(FOLDER_PATH) if f.lower().endswith(('.jpg', '.png', '.jpeg'))]
+    image_files.sort()
 
-    for idx, filename in enumerate(image_files):
-        image_path = os.path.join(folder_path, filename)
-        try:
-            img_b64 = encode_image(image_path)
-            print(f"\n[PROCESSING] {filename}")
-            start = time()
-            result = send_image_rest(api_url, img_b64)
-            duration = round(time() - start, 2)
+    for idx, filename in enumerate(image_files, 1):
+        image_path = os.path.join(FOLDER_PATH, filename)
+        print(f"[{idx}/{len(image_files)}] Sending {filename} to API...")
 
-            if result.get("success"):
-                detection = result["results"][0]
-                metadata = detection.get("metadata", {})
-                detections = detection.get("detections", [])
-                print(f"[RESULT] Metadata: {metadata} | Time: {duration}s")
+        results = send_image_to_api(image_path)
+        if results is None:
+            print("[SKIP] Failed to get result from API.")
+            continue
 
-                # Hiển thị ảnh kèm bounding box
-                original_img = cv2.imread(image_path)
-                if original_img is not None:
-                    annotated = draw_detections(original_img.copy(), detections)
-                    cv2.imshow("Result", annotated)
-
-                    # Tự động chuyển sau delay, hoặc nhấn 'q' để thoát
-                    key = cv2.waitKey(int(delay_between_images * 1000)) & 0xFF
-                    if key == ord('q'):
-                        print("[INFO] Quit requested.")
-                        break
-
-            else:
-                print(f"[ERROR] Failed to process {filename}: {result.get('error')}")
-
-        except Exception as e:
-            print(f"[EXCEPTION] {filename}: {e}")
-
-    cv2.destroyAllWindows()
-    print("[INFO] All done.")
+        annotated_img = draw_results(image_path, results)
+        show_image(annotated_img, title=filename)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Auto REST Client for Folder Images")
-    parser.add_argument("--folder", type=str, required=True, help="Folder chứa ảnh cần gửi")
-    parser.add_argument("--api_url", type=str, default="http://localhost:8000/process-batch", help="REST API URL")
-    parser.add_argument("--delay", type=float, default=1.0, help="Delay giữa các ảnh (giây)")
-
-    args = parser.parse_args()
-    main(args.folder, args.api_url, args.delay)
+    main()
