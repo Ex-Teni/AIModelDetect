@@ -56,7 +56,7 @@ def show_image(image, title="Annotated Result"):
     plt.imshow(rgb)
     plt.title(title)
     plt.axis('off')
-    plt.pause(2)  
+    plt.pause(5)  
     plt.close()
 
 def main():

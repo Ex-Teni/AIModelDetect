@@ -145,7 +145,18 @@ class OCRModels:
             print(f"[ERROR] PaddleOCR initialization failed: {e}")
             self.paddle_ocr = None
 
-        self.easy_ocr = easyocr.Reader(['en'], gpu=True)
+        # EasyOCR init
+        try:
+            self.easy_ocr = easyocr.Reader(
+                ['en'], 
+                gpu=torch.cuda.is_available(),
+                model_storage_directory='./easyocr_models',
+                download_enabled=True
+            )
+            print("[INFO] EasyOCR initialized successfully")
+        except Exception as e:
+            print(f"[ERROR] EasyOCR initialization failed: {e}")
+            self.easy_ocr = None
 
 
 @dataclass
@@ -239,54 +250,64 @@ def preprocess_for_plate_text(image: np.ndarray) -> List[np.ndarray]:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
         h, w = gray.shape
 
-        if h < 60 or w < 200:
-            scale_factor = max(60/h, 200/w, 1.5)
+        # Scale up nếu ảnh quá nhỏ
+        if h < 80 or w < 200:
+            scale_factor = max(80/h, 200/w, 2.0)  # Tăng scale factor
             new_w, new_h = int(w * scale_factor), int(h * scale_factor)
             gray = cv2.resize(gray, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
             h, w = new_h, new_w
         
-        # 1. Baseline - CLAHE moderate để cải thiện contrast
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 4))
+        # 1. Baseline - CLAHE với tham số tối ưu cho biển số VN
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
         processed_variants.append(enhanced)
         
-        # 2. Giảm noise + tăng contrast - phù hợp với ảnh có nhiễu
-        # Gaussian blur nhẹ trước khi CLAHE
-        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-        clahe_strong = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(4, 2))
-        enhanced_strong = clahe_strong.apply(blurred)
-        processed_variants.append(enhanced_strong)
+        # 2. Xử lý ảnh có độ tương phản thấp
+        # Histogram equalization + CLAHE
+        equalized = cv2.equalizeHist(gray)
+        clahe_eq = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+        enhanced_eq = clahe_eq.apply(equalized)
+        processed_variants.append(enhanced_eq)
         
-        # 3. Xử lý cho ảnh tối/thiếu sáng (như ảnh 2)
-        # Gamma correction + CLAHE
-        gamma = 1.5  # Tăng độ sáng
-        gamma_corrected = np.power(gray / 255.0, 1.0/gamma) # type: ignore
-        gamma_corrected = np.uint8(gamma_corrected * 255)
-        enhanced_gamma = clahe.apply(gamma_corrected) # type: ignore
-        processed_variants.append(enhanced_gamma)
+        # 3. Xử lý cho ảnh tối/thiếu sáng
+        # Gamma correction với giá trị tối ưu
+        gamma = 0.8  # Giảm gamma để tăng contrast
+        gamma_table = np.array([((i / 255.0) ** (1.0 / gamma)) * 255 for i in np.arange(0, 256)]).astype("uint8")
+        gamma_corrected = cv2.LUT(gray, gamma_table)
+        processed_variants.append(gamma_corrected)
         
-        # 4. Sharpening cho text mờ
-        kernel_sharpen = np.array([[-1, -1, -1], 
-                                  [-1, 9, -1], 
-                                  [-1, -1, -1]])
-        sharpened = cv2.filter2D(enhanced, -1, kernel_sharpen)
-        # Clamp values
-        sharpened = np.clip(sharpened, 0, 255).astype(np.uint8)
-        processed_variants.append(sharpened)
+        # 4. Bilateral filter + sharpening cho text rõ nét hơn
+        bilateral = cv2.bilateralFilter(gray, 9, 75, 75)
+        # Unsharp masking
+        gaussian = cv2.GaussianBlur(bilateral, (0, 0), 2.0)
+        unsharp = cv2.addWeighted(bilateral, 1.5, gaussian, -0.5, 0)
+        processed_variants.append(unsharp)
         
-        # 5. Morphological operations để kết nối ký tự bị gãy
-        kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
-        closed = cv2.morphologyEx(enhanced, cv2.MORPH_CLOSE, kernel_close)
-        processed_variants.append(closed)
+        # 5. Morphological operations để làm sạch và kết nối text
+        # Closing để kết nối các phần bị đứt
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 1))
+        closed = cv2.morphologyEx(enhanced, cv2.MORPH_CLOSE, kernel)
+        # Opening để loại bỏ noise nhỏ
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 2))
+        cleaned = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel_open)
+        processed_variants.append(cleaned)
         
-        # 6. Adaptive threshold cho các trường hợp khó
-        adaptive_thresh = cv2.adaptiveThreshold(
+        # 6. Adaptive threshold với nhiều tham số khác nhau
+        # Method 1: Gaussian adaptive
+        adaptive1 = cv2.adaptiveThreshold(
             enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-            cv2.THRESH_BINARY, 15, 8
+            cv2.THRESH_BINARY, 11, 2
         )
-        processed_variants.append(adaptive_thresh)
+        processed_variants.append(adaptive1)
         
-        return processed_variants[:6]
+        # Method 2: Mean adaptive
+        adaptive2 = cv2.adaptiveThreshold(
+            enhanced, 255, cv2.ADAPTIVE_THRESH_MEAN_C, 
+            cv2.THRESH_BINARY, 15, 3
+        )
+        processed_variants.append(adaptive2)
+        
+        return processed_variants[:7]  # Trả về tối đa 7 variants
     
     except Exception as e:
         print(f"[ERROR] Plate preprocessing failed: {e}")
@@ -411,9 +432,12 @@ def format_vietnam_plate(text: str) -> Optional[str]:
     """
     Format theo chuẩn biển số Việt Nam: 2 số + 1-2 chữ + 4-6 số
     """
-    if not text or len(text) < 6:
+    if not text:
         return None
     
+    # Loại bỏ mọi ký tự không phải chữ hoặc số
+    text = re.sub(r'[^A-Z0-9]', '', text.upper().strip())
+
     # Mapping để sửa lỗi OCR
     to_digit = {'O': '0', 'D': '0', 'Q': '0', 'B': '8', 'S': '5', 'Z': '2', 'G': '6', 'I': '1', 'L': '1'}
     to_letter = {'0': 'O', '1': 'I', '2': 'Z', '5': 'S', '6': 'G', '8': 'B'}
@@ -504,44 +528,6 @@ def clean_container_text(text: str) -> Optional[str]:
         '@': '8', '?': '7', '%': '8'
     }
 
-    # # Tách chữ và số
-    # letters = ''.join([c for c in text if c.isalpha()])
-    # numbers = ''.join([c for c in text if c.isdigit()])
-    
-    # # Format chuẩn container: 4 chữ + 7 số
-    # if len(letters) >= 4 and len(numbers) >= 6:
-    #     # 4 ký tự đầu là chữ
-    #     letter_part = letters[:4]
-    #     # Sửa lỗi OCR cho phần chữ
-    #     letter_corrected = ''
-    #     for char in letter_part:
-    #         if char.isdigit():
-    #             # Chuyển số thành chữ
-    #             digit_to_letter = {'0': 'O', '1': 'I', '2': 'Z', '5': 'S', '6': 'G', '8': 'B'}
-    #             letter_corrected += digit_to_letter.get(char, char)
-    #         else:
-    #             letter_corrected += char
-        
-    #     # Phần số (lấy 6-7 ký tự)
-    #     number_part = numbers[:7] if len(numbers) >= 7 else numbers
-    #     # Sửa lỗi OCR cho phần số
-    #     number_corrected = ''
-    #     for char in number_part:
-    #         if char.isalpha():
-    #             number_corrected += corrections.get(char, char)
-    #         else:
-    #             number_corrected += char
-        
-    #     result = letter_corrected + number_corrected
-    #     result = result[:10]
-
-    #     # Kiểm tra format cuối cùng
-    #     if len(result) >= 10 and re.match(r'^[A-Z]{4}\d{6,7}$', result):
-    #         return result
-        
-    # text = text[:10]
-    # return text if len(text) >= 6 else None
-
     if len(text) >= 10:
         # 4 ký tự đầu phải là chữ
         letter_part = text[:4]
@@ -558,7 +544,7 @@ def clean_container_text(text: str) -> Optional[str]:
         
         # Sửa lỗi OCR cho phần số (lấy 6-7 ký tự)
         corrected_numbers = ''
-        for char in number_part[:7]:
+        for char in number_part[:6]:
             if char.isalpha():
                 corrected_numbers += corrections.get(char, '0')
             else:
@@ -572,7 +558,7 @@ def clean_container_text(text: str) -> Optional[str]:
     
     # Fallback: làm sạch basic
     if len(text) >= 8:
-        return text[:11]  # Giới hạn độ dài
+        return text[:11]  # Giới hạn độ dài 
     
     return None
 
@@ -585,7 +571,6 @@ def extract_text_plate(image_crop: np.ndarray, ocr_models) -> Tuple[Optional[str
         # 1. Phát hiện layout
         layout_info = detect_plate_layout(image_crop)
         is_multiline = layout_info['is_multiline']
-        reading_direction = layout_info.get('reading_direction', 'left_to_right')
         print(f"[INFO] Detected layout: {'Multiline' if is_multiline else 'Single line'}")
         
         # 2. Tiền xử lý chuyên biệt
@@ -604,230 +589,179 @@ def extract_text_plate(image_crop: np.ndarray, ocr_models) -> Tuple[Optional[str
                     elif processed_img.shape[2] == 1:
                         processed_img = cv2.cvtColor(processed_img, cv2.COLOR_GRAY2BGR)
 
-                    paddle_results = ocr_models.paddle_ocr.ocr(processed_img)
+                    paddle_results = ocr_models.paddle_ocr.ocr(
+                        processed_img,
+                        det=True,  # Enable detection
+                        rec=True,  # Enable recognition  
+                        cls=True,  # Enable classification/rotation
+                        )
                     
-                    # Xử lý nhiều trường hợp trả về khác nhau
-                    texts = []
-                    confidences = []
-                    text_boxes = []
-                    
-                    if paddle_results is not None:
-                        # Trường hợp 1: paddle_results là list chứa list
-                        if isinstance(paddle_results, list) and len(paddle_results) > 0:
-                            first_result = paddle_results[0]
-                            
-                            # Trường hợp 1a: first_result là list các detection
-                            if isinstance(first_result, list):
-                                for line in first_result:
-                                    try:
-                                        # Kiểm tra cấu trúc: [bbox, (text, confidence)]
-                                        if isinstance(line, list) and len(line) >= 2:
-                                            bbox = line[0]
-                                            text_info = line[1]
-                                            if isinstance(text_info, tuple) and len(text_info) >= 2:
-                                                text, conf = text_info[0], text_info[1]
-                                                if text and isinstance(text, str) and text.strip():
-                                                    # Tính toán vị trí trung tâm của bbox
-                                                    center_y = sum([p[1] for p in bbox]) / 4
-                                                    center_x = sum([p[0] for p in bbox]) / 4
-                                                    
-                                                    texts.append(text.strip())
-                                                    confidences.append(float(conf))
-                                                    text_boxes.append({'center_x': center_x, 'center_y': center_y})
-                                    except (IndexError, TypeError, ValueError) as line_e:
-                                        print(f"[WARN] Skipping malformed PaddleOCR line in variant {variant_idx}: {line_e}")
-                                        continue
-                                if texts and text_boxes:
-                                    # Kết hợp texts với positions
-                                    combined_data = list(zip(texts, confidences, text_boxes))
+                    if paddle_results and paddle_results[0]:
+                        texts = []
+                        confidences = []
+                        positions = []
+                        
+                        for line in paddle_results[0]:
+                            if line and len(line) >= 2:
+                                bbox, (text, conf) = line[0], line[1]
+                                if text and text.strip() and conf > 0.1:
+                                    # Tính vị trí trung tâm để sắp xếp
+                                    center_y = sum([p[1] for p in bbox]) / 4
+                                    center_x = sum([p[0] for p in bbox]) / 4
                                     
-                                    if is_multiline:
-                                        # Sắp xếp theo Y trước (top to bottom), rồi X (left to right)
-                                        combined_data.sort(key=lambda x: (x[2]['center_y'], x[2]['center_x']))
-                                    else:
-                                        # Sắp xếp theo X (left to right)
-                                        combined_data.sort(key=lambda x: x[2]['center_x'])
-                                    
-                                    # Tách lại thành các list riêng biệt
-                                    texts = [item[0] for item in combined_data]
-                                    confidences = [item[1] for item in combined_data]
-
-                                    if is_multiline and len(texts) > 1:
-                                        combined_text = '\n'.join(texts)
-                                    else:
-                                        combined_text = ''.join(texts)
-                    
-                            
-                            # Trường hợp 1b: first_result là tuple (text, confidence)
-                            elif isinstance(first_result, tuple) and len(first_result) >= 2:
-                                text, conf = first_result[0], first_result[1]
-                                if text and isinstance(text, str) and text.strip():
                                     texts.append(text.strip())
                                     confidences.append(float(conf))
+                                    positions.append((center_x, center_y))
+                        
+                        if texts:
+                            # Sắp xếp theo vị trí
+                            if is_multiline and len(texts) > 1:
+                                # Sắp xếp theo Y trước (top to bottom), rồi X (left to right)
+                                combined = list(zip(texts, confidences, positions))
+                                combined.sort(key=lambda x: (x[2][1], x[2][0]))
+                                texts = [x[0] for x in combined]
+                                confidences = [x[1] for x in combined]
+                                
+                                # Combine multiline text
+                                combined_text = ' '.join(texts)  # Dùng space thay vì \n
+                            else:
+                                # Single line - lấy text với confidence cao nhất
+                                if len(texts) > 1:
+                                    best_idx = confidences.index(max(confidences))
+                                    combined_text = texts[best_idx]
+                                    avg_conf = confidences[best_idx]
+                                else:
+                                    combined_text = texts[0]
+                                    avg_conf = confidences[0]
                             
-                            # Trường hợp 1c: first_result là string
-                            elif isinstance(first_result, str) and first_result.strip():
-                                texts.append(first_result.strip())
-                                confidences.append(0.5)  # Default confidence
+                            if 'avg_conf' not in locals():
+                                avg_conf = sum(confidences) / len(confidences)
                             
-                            # Trường hợp 1d: first_result là dict
-                            elif isinstance(first_result, dict) and 'rec_texts' in first_result and 'rec_scores' in first_result:
-                                try:
-                                    if 'rec_texts' in first_result and 'rec_scores' in first_result:
-                                        texts = [t.strip() for t in first_result['rec_texts'] if isinstance(t, str) and t.strip()]
-                                        confidences = [float(s) for s in first_result['rec_scores']]
-                                        if texts and confidences:
-                                            combined_text = ''.join(texts)
-                                            avg_conf = sum(confidences) / len(confidences)
-                                            cleaned = clean_container_text(combined_text)
-                                            if cleaned:
-                                                ocr_attempts.append((cleaned, avg_conf, f"PaddleOCR_v{variant_idx}"))
-                                                print(f"[SUCCESS] PaddleOCR container variant {variant_idx}: {cleaned} (conf: {avg_conf:.3f})")
-                                except Exception as parse_e:
-                                    print(f"[WARN] Failed to parse dict result in PaddleOCR container: {parse_e}")
-                        
-                        # Trường hợp 2: paddle_results trực tiếp là list các detection
-                        elif isinstance(paddle_results, list):
-                            for item in paddle_results:
-                                try:
-                                    if isinstance(item, list) and len(item) >= 2:
-                                        text_info = item[1]
-                                        if isinstance(text_info, tuple) and len(text_info) >= 2:
-                                            text, conf = text_info[0], text_info[1]
-                                            if text and isinstance(text, str) and text.strip():
-                                                texts.append(text.strip())
-                                                confidences.append(float(conf))
-                                except (IndexError, TypeError, ValueError):
-                                    continue
-                    
-                    # Xử lý kết quả thu được
-                    if texts and confidences:
-                        if is_multiline and len(texts) > 1:
-                            combined_text = '\n'.join(texts)
-                        else:
-                            combined_text = texts[0] if texts else ""
-                        
-                        avg_conf = sum(confidences) / len(confidences)
-                        cleaned = clean_plate_text(combined_text, is_multiline)
-                        
-                        if cleaned:
-                            ocr_attempts.append((cleaned, avg_conf, f"PaddleOCR_v{variant_idx}"))
-                            print(f"[SUCCESS] PaddleOCR variant {variant_idx}: {cleaned} (conf: {avg_conf:.3f})")
-                    else:
-                        print(f"[INFO] PaddleOCR variant {variant_idx} returned no valid text")
-                        
+                            # Clean text
+                            cleaned = format_vietnam_plate(combined_text)
+                            if cleaned and len(cleaned) >= 6:
+                                # Bonus cho các pattern Vietnam
+                                pattern_bonus = 0
+                                clean_no_space = cleaned.replace(' ', '')
+                                if re.match(r'^\d{2}[A-Z]\d{4,6}$', clean_no_space):
+                                    pattern_bonus = 0.15
+                                elif re.match(r'^\d{2}[A-Z]{2}\d{4,6}$', clean_no_space):
+                                    pattern_bonus = 0.15
+                                
+                                final_conf = min(avg_conf + pattern_bonus, 1.0)
+                                ocr_attempts.append((cleaned, final_conf, f"PaddleOCR_v{variant_idx}"))
+                                print(f"[SUCCESS] PaddleOCR variant {variant_idx}: {cleaned} (conf: {final_conf:.3f})")
+                                
             except Exception as e:
-                print(f"[ERROR] PaddleOCR variant {variant_idx} failed: {e}")
+                print(f"[ERROR] PaddleOCR variant {variant_idx} failed: {e}")    
 
-
-            # Try EasyOCR
+            # EasyOCR
             try:
                 if ocr_models.easy_ocr:
                     easy_results = ocr_models.easy_ocr.readtext(
                         processed_img,
                         allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-',
-                        width_ths=0.6,
-                        height_ths=0.3 if is_multiline else 0.6,
-                        paragraph=is_multiline,
-                        decoder='greedy'
+                        width_ths=0.5,
+                        height_ths=0.2,
+                        paragraph =False,
+                        detail=1,
+                        batch_size=1
                     )
-                    if easy_results and isinstance(easy_results, list):
-                        valid_items = [r for r in easy_results if isinstance(r, (list, tuple)) and len(r) >= 3]
+
+                    if easy_results:
+                        valid_items = []
+                        for item in easy_results:
+                            if len(item) >= 3 and item[1].strip() and item[2] > 0.1:
+                                valid_items.append(item)
                         
                         if valid_items:
-                            # IMPROVED: Sắp xếp theo vị trí
-                            if is_multiline:
-                                # Sắp xếp theo Y trước, rồi X
-                                valid_items.sort(key=lambda x: (x[0][0][1], x[0][0][0]))
-                            else:
-                                # Sắp xếp theo X
-                                valid_items.sort(key=lambda x: x[0][0][0])
-                            
+                            # Sắp xếp theo vị trí và confidence
                             if is_multiline and len(valid_items) > 1:
-                                texts = [r[1] for r in valid_items]
-                                combined_text = '\n'.join(texts)
-                                avg_conf = sum([r[2] for r in valid_items]) / len(valid_items)
-                                cleaned = clean_plate_text(combined_text, is_multiline)
-                                if cleaned:
-                                    ocr_attempts.append((cleaned, avg_conf, f"EasyOCR_v{variant_idx}"))
-                                
+                                # Sắp xếp theo Y coordinate
+                                valid_items.sort(key=lambda x: x[0][0][1])
+                                texts = [item[1] for item in valid_items]
+                                combined_text = ' '.join(texts)
+                                avg_conf = sum([item[2] for item in valid_items]) / len(valid_items)
                             else:
-                                best_result = max(valid_items, key=lambda x: x[2])
-                                combined_text = best_result[1]
-                                avg_conf = best_result[2]
-                                cleaned = clean_plate_text(combined_text, is_multiline)
-                                if cleaned:
-                                    ocr_attempts.append((cleaned, avg_conf, f"EasyOCR_v{variant_idx}"))
-                        
-                        else:
-                            print(f"[INFO] EasyOCR variant {variant_idx} returned empty or invalid format")
-
+                                # Lấy result tốt nhất
+                                best_item = max(valid_items, key=lambda x: x[2])
+                                combined_text = best_item[1]
+                                avg_conf = best_item[2]
+                            
+                            cleaned = format_vietnam_plate(combined_text)
+                            if cleaned and len(cleaned) >= 6:
+                                # Pattern bonus
+                                pattern_bonus = 0
+                                clean_no_space = cleaned.replace(' ', '')
+                                if re.match(r'^\d{2}[A-Z]\d{4,6}$', clean_no_space):
+                                    pattern_bonus = 0.1
+                                
+                                final_conf = min(avg_conf + pattern_bonus, 1.0)
+                                ocr_attempts.append((cleaned, final_conf, f"EasyOCR_v{variant_idx}"))
+                                print(f"[SUCCESS] EasyOCR variant {variant_idx}: {cleaned} (conf: {final_conf:.3f})")
+                                
             except Exception as e:
                 print(f"[ERROR] EasyOCR variant {variant_idx} failed: {e}")
-
-            # Append best attempt
+            
+            # Thêm best attempt vào results
             if ocr_attempts:
                 best = max(ocr_attempts, key=lambda x: x[1])
-                if best[1] > 0.3:
-                    bonus = 0.1 if variant_idx < 4 else 0
-                    final_conf = min(best[1] + bonus, 1.0)
+                if best[1] > 0.2:  # Giảm threshold
                     all_results.append(PlateResult(
                         text=best[0],
-                        confidence=final_conf,
+                        confidence=best[1],
                         method=best[2],
                         is_multiline=is_multiline
                     ))
-
+        
+        # 4. Voting và consensus
         if all_results:
-            # Voting
-            if len(all_results) >= 3:
-                votes = {}
-                for res in all_results:
-                    if res.text in votes:
-                        votes[res.text]['count'] += 1
-                        votes[res.text]['conf'] += res.confidence
-                    else:
-                        votes[res.text] = {'count': 1, 'conf': res.confidence}
-
-                for t, v in votes.items():
-                    if v['count'] >= 2:
-                        avg_conf = v['conf'] / v['count']
-                        bonus = 0.1 * (v['count'] - 1)
-                        all_results.append(PlateResult(
-                            text=t,
-                            confidence=min(avg_conf + bonus, 1.0),
-                            method=f"Consensus_{v['count']}",
-                            is_multiline=is_multiline
-                        ))
-
-            # Score & chọn kết quả tốt nhất
-            def score(r):
-                base = r.confidence
-                method_bonus = 0.1 if 'PaddleOCR' in r.method else 0.05 if 'EasyOCR' in r.method else 0
-                multiline_bonus = 0.05 if r.is_multiline else 0
+            # Improved scoring system
+            def calculate_score(result):
+                base_score = result.confidence
                 
-                # Pattern validation bonus
-                text_clean = r.text.replace('-', '').replace('\n', '')
+                # Method bonus
+                method_bonus = 0.1 if 'PaddleOCR' in result.method else 0.05
+                
+                # Pattern matching bonus
+                text_clean = result.text.replace(' ', '').replace('-', '').replace('.', '')
+                pattern_bonus = 0
+                
+                # Vietnam license plate patterns
+                if re.match(r'^\d{2}[A-Z]\d{4,6}$', text_clean):  # Standard format
+                    pattern_bonus = 0.2
+                elif re.match(r'^\d{2}[A-Z]{2}\d{4,6}$', text_clean):  # Taxi/business format  
+                    pattern_bonus = 0.2
+                elif re.match(r'^\d{7,8}$', text_clean):  # All numbers (some cases)
+                    pattern_bonus = 0.1
+                
+                # Length bonus
                 length_bonus = 0.05 if 6 <= len(text_clean) <= 10 else -0.1
                 
-                # Vietnam license plate pattern bonus
-                vietnam_pattern_bonus = 0
-                if re.match(r'^\d{2}[A-Z]\d{4,6}$', text_clean):  # 12A34567
-                    vietnam_pattern_bonus = 0.1
-                elif re.match(r'^\d{2}[A-Z]{2}\d{4,6}$', text_clean):  # 12AB34567
-                    vietnam_pattern_bonus = 0.1
-                elif re.match(r'^\d{2}[A-Z]\d{3}\.\d{2}$', text_clean):  # 12A123.45
-                    vietnam_pattern_bonus = 0.1
+                # Character consistency bonus
+                consistency_bonus = 0
+                if len(text_clean) >= 6:
+                    # First 2 should be digits
+                    if text_clean[:2].isdigit():
+                        consistency_bonus += 0.05
+                    # Should have at least one letter
+                    if any(c.isalpha() for c in text_clean):
+                        consistency_bonus += 0.05
                 
-                return base + method_bonus + multiline_bonus + length_bonus + vietnam_pattern_bonus
+                return base_score + method_bonus + pattern_bonus + length_bonus + consistency_bonus
             
-            all_results.sort(key=score, reverse=True)
-            best_result = all_results[0]
-            print(f"[SUCCESS] Best result: {best_result.text} (conf: {best_result.confidence:.3f}, method: {best_result.method})")
-            return best_result.text, best_result.confidence
-
+            # Apply scoring
+            scored_results = [(r, calculate_score(r)) for r in all_results]
+            scored_results.sort(key=lambda x: x[1], reverse=True)
+            
+            if scored_results:
+                best_result, best_score = scored_results[0]
+                print(f"[SUCCESS] Best plate result: {best_result.text} (score: {best_score:.3f}, method: {best_result.method})")
+                return best_result.text, best_score
+        
+        print("[INFO] No valid plate text extracted")
         return None, 0.0
-
+        
     except Exception as e:
         print(f"[FAILED] Enhanced plate OCR failed: {e}")
         return None, 0.0
