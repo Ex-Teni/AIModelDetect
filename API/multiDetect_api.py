@@ -41,7 +41,8 @@ class GlobalState:
         self.models_loaded = False
 
 # Detection thresholds
-FACE_CONFIDENCE_THRESHOLD = 0.3  # Face detection threshold
+FACE_DETECTION_THRESHOLD = 0.1    # Threshold cho MTCNN detection
+FACE_CLASSIFICATION_THRESHOLD = 0.15  # Threshold cho classification
 OCR_CONFIDENCE_THRESHOLD = 0.3    # OCR confidence threshold
 SEAL_OCR_CONFIDENCE_THRESHOLD = 0.25  # Threshold for seal detection
 
@@ -150,7 +151,7 @@ class OCRModels:
             self.easy_ocr = easyocr.Reader(
                 ['en'], 
                 gpu=torch.cuda.is_available(),
-                model_storage_directory='./easyocr_models',
+                model_storage_directory='modelAI/easyocr_models',
                 download_enabled=True
             )
             print("[INFO] EasyOCR initialized successfully")
@@ -1111,23 +1112,32 @@ def detect_containers(frame: np.ndarray) -> List[Dict]:
     return results
 
 def detect_faces(frame):
-    """Detect and recognize faces in frame"""
+    """Detect and recognize faces in frame with improved debugging"""
     if model_manager.face_classifier is None or model_manager.label_encoder is None or model_manager.face_models.get('mtcnn') is None:
+        print("[DEBUG] Face models not loaded")
         return []
 
     results = []
     try:
         img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
         mtcnn = model_manager.face_models['mtcnn']
-        boxes, probs = mtcnn.detect(img_rgb) # type: ignore
-
+        
+        # 1. MTCNN Detection
+        boxes, probs = mtcnn.detect(img_rgb)
+        
         if boxes is None or len(boxes) == 0:
+            print("[DEBUG] No faces detected by MTCNN")
             return []
+        
+        print(f"[DEBUG] MTCNN detected {len(boxes)} faces with probs: {probs}")
 
         for i, box in enumerate(boxes):
             prob = float(probs[i]) if probs is not None else 0.0
-            if prob < FACE_CONFIDENCE_THRESHOLD:
+            
+            # GIẢM threshold detection xuống để test
+            DETECTION_THRESHOLD = 0.1  # Giảm từ 0.3 xuống 0.1
+            if prob < DETECTION_THRESHOLD:
+                print(f"[DEBUG] Face {i} rejected: detection prob {prob} < {DETECTION_THRESHOLD}")
                 continue
 
             x1, y1, x2, y2 = map(int, box)
@@ -1136,39 +1146,54 @@ def detect_faces(frame):
             x2c, y2c = min(w, x2), min(h, y2)
             
             if x2c <= x1c or y2c <= y1c:
+                print(f"[DEBUG] Invalid box coordinates: {x1c}, {y1c}, {x2c}, {y2c}")
                 continue
 
-            # Extract face and get embedding
+            # 2. Extract face and get embedding
             face_crop = img_rgb[y1c:y2c, x1c:x2c]
+            print(f"[DEBUG] Face crop shape: {face_crop.shape}")
+            
             face_pil = Image.fromarray(face_crop)
-            face_tensor = model_manager.face_transform(face_pil).unsqueeze(0).to(device) # type: ignore
+            face_tensor = model_manager.face_transform(face_pil).unsqueeze(0).to(device_gpu)  # type: ignore # FIX: dùng device_gpu
 
             with torch.no_grad():
                 embedding = model_manager.face_models['facenet'](face_tensor).cpu().numpy()
+            
+            print(f"[DEBUG] Embedding shape: {embedding.shape}")
 
-            # Classify face
+            # 3. Classify face
             proba_list = model_manager.face_classifier.predict_proba(embedding)[0]
             best_idx = np.argmax(proba_list)
             best_prob = float(proba_list[best_idx])
             
-            if best_prob >= FACE_CONFIDENCE_THRESHOLD:
+            print(f"[DEBUG] Classification - Best idx: {best_idx}, Best prob: {best_prob}")
+            print(f"[DEBUG] All probabilities: {proba_list}")
+            
+            # GIẢM classification threshold
+            CLASSIFICATION_THRESHOLD = 0.15  # Giảm từ 0.3 xuống 0.15
+            if best_prob >= CLASSIFICATION_THRESHOLD:
                 name = model_manager.label_encoder.inverse_transform([best_idx])[0]
+                print(f"[DEBUG] Recognized as: {name} with confidence {best_prob}")
             else:
                 name = "Unknown"
-
+                print(f"[DEBUG] Unknown face - best prob {best_prob} < {CLASSIFICATION_THRESHOLD}")
 
             results.append({
                 "type": "face",
                 "box": [x1c, y1c, x2c, y2c],
                 "text": name,
-                "confidence": best_prob
+                "confidence": best_prob,
+                "detection_confidence": prob  # Thêm detection confidence để debug
             })
 
         return results
 
     except Exception as e:
         print(f"[FAILED] Face detection failed: {e}")
+        import traceback
+        traceback.print_exc()  # In full stacktrace để debug
         return []
+
 
 # ===== DRAWING AND VISUALIZATION =====
 def draw_detections(frame, detections):
@@ -1309,8 +1334,7 @@ async def websocket_combined_detection(websocket: WebSocket):
     try:
         while True:
             try:
-                # Không sử dụng timeout cho việc nhận tin nhắn
-                # Thay vào đó dựa vào việc client gửi liên tục
+                # Client gửi liên tục
                 raw_message = await websocket.receive_text()
                 
                 message = json.loads(raw_message)

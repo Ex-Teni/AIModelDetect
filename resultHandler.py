@@ -119,7 +119,6 @@ class APITester:
 
     def calculate_accuracy_percentage(self, actual: Optional[str], predicted: Optional[str]) -> float:
         """
-        Tính độ chính xác dựa trên Levenshtein distance
         - Trả về -1 nếu actual là None (không tính trong thống kê)
         - Trả về 0 nếu cả actual và predicted đều None
         - Trả về % accuracy cho các trường hợp khác
