@@ -16,7 +16,7 @@ from .base_detector import BaseDetector
 class FaceDetector(BaseDetector):
     """Detector cho khuôn mặt"""
     
-    def __load_model(self):
+    def _load_model(self):
         """Load các model cần thiết cho face detection và recognition"""
         self.mtcnn = MTCNN(keep_all=True, device=self.device)
         self.facenet = InceptionResnetV1(pretrained='vggface2').eval().to(self.device)

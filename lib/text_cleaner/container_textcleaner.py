@@ -1,5 +1,5 @@
 import re
-from typing import Optional
+from typing import Optional, Tuple
 from .base_textcleaner import BaseTextCleaner
 
 class ContainerTextCleaner(BaseTextCleaner):
@@ -35,3 +35,30 @@ class ContainerTextCleaner(BaseTextCleaner):
         if len(text) >= 8:
             return text[:11]
         return None
+
+    def _normalize_and_fix_orientation(self, text: str) -> Tuple[str, float]:
+        """
+        Chuẩn hóa text: remove space/hyphen, upper.
+        Sửa orientation nếu match pattern đảo: 7 số + 4 chữ → đảo lại thành 4 chữ + 7 số.
+        Trả về (text_chuẩn, bonus).
+        """
+        t = (text or "").replace(" ", "").replace("-", "").upper()
+    
+        # Pattern container ISO chuẩn: 4 chữ + 7 số
+        if re.match(r'^[A-Z]{4}\d{7}$', t):
+            return t, 0.30  # bonus cao vì match chuẩn
+    
+        # Pattern đảo: 7 số + 4 chữ (có thể do đọc ngược)
+        if re.match(r'^\d{7}[A-Z]{4}$', t):
+            rev = t[::-1]
+            if re.match(r'^[A-Z]{4}\d{7}$', rev):
+                return rev, 0.30  # đảo về chuẩn và áp bonus
+            # Nếu đảo không ra chuẩn, vẫn trả t với bonus nhẹ để vote yếu
+            return t, 0.10
+    
+        # Pattern “gần đúng”: 4 chữ + 6 số (thiếu 1 số)
+        if re.match(r'^[A-Z]{4}\d{6}$', t):
+            return t, 0.15
+    
+        # Không match gì đặc biệt
+        return t, 0.0

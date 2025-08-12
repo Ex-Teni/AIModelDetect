@@ -119,41 +119,41 @@ class MultiDetect_Core:
     
     # ===== VIDEO PROCESSING METHODS =====
     
-    def process_realtime_camera(self, camera_id: int = 0, 
-                               callback_func: Optional[Callable[[np.ndarray, List[DetectionResult]], None]] = None): 
-        """
-        Xử lý camera realtime
+    # def process_realtime_camera(self, camera_id: int = 0, 
+    #                            callback_func: Optional[Callable[[np.ndarray, List[DetectionResult]], None]] = None): 
+    #     """
+    #     Xử lý camera realtime
         
-        Args:
-            camera_id: ID camera
-            callback_func: Hàm callback nhận kết quả mỗi frame
-        """
-        cap = cv2.VideoCapture(camera_id)
+    #     Args:
+    #         camera_id: ID camera
+    #         callback_func: Hàm callback nhận kết quả mỗi frame
+    #     """
+    #     cap = cv2.VideoCapture(camera_id)
         
-        try:
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
+    #     try:
+    #         while True:
+    #             ret, frame = cap.read()
+    #             if not ret:
+    #                 break
                 
-                # Phát hiện đối tượng
-                detections = self.detect_all(frame)
+    #             # Phát hiện đối tượng
+    #             detections = self.detect_all(frame)
                 
-                # Vẽ annotation
-                annotated_frame = self.image_processor.draw_detections(frame, detections)
+    #             # Vẽ annotation
+    #             annotated_frame = self.image_processor.draw_detections(frame, detections)
                 
-                # Gọi callback nếu có
-                if callback_func:
-                    callback_func(annotated_frame, detections)
+    #             # Gọi callback nếu có
+    #             if callback_func:
+    #                 callback_func(annotated_frame, detections)
                 
-                # Hiển thị
-                cv2.imshow('MultiDetect Live', annotated_frame)
+    #             # Hiển thị
+    #             cv2.imshow('MultiDetect Live', annotated_frame)
                 
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
-        finally:
-            cap.release()
-            cv2.destroyAllWindows()
+    #             if cv2.waitKey(1) & 0xFF == ord('q'):
+    #                 break
+    #     finally:
+    #         cap.release()
+    #         cv2.destroyAllWindows()
     
     # ===== UTILITY METHODS =====
     
