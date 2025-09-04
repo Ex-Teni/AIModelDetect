@@ -1,5 +1,6 @@
 from typing import List, Tuple
-import importlib.resources as pkg_resources
+from importlib import resources
+import torch
 import numpy as np
 from ultralytics import YOLO
 
@@ -10,9 +11,9 @@ from ..ocr import ContainerOCR
 class ContainerDetector(BaseDetector):
     """Detector cho biến số xe"""
     def _load_model(self):
-        with pkg_resources.path('lib.model', 'detect_ContainerCode.pt') as model_path:
-            self.model = YOLO(str(model_path)).to(self.device)
-        self.ocr = ContainerOCR()
+        with resources.path('lib.model', 'detect_ContainerCode.pt') as model_path:
+            self.model = YOLO(str(model_path))
+            self.ocr = ContainerOCR()
 
     def _safe_crop(self, 
                    image: np.ndarray, 

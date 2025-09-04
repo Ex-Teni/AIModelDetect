@@ -112,7 +112,7 @@ class PlatePreprocessor(BasePreprocessor):
 
     def _apply_clahe(self, gray: np.ndarray) -> np.ndarray:
         """CLAHE tối ưu cho biển số VN"""
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,0))
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,2))
         return clahe.apply(gray)
 
 
@@ -125,7 +125,7 @@ class PlatePreprocessor(BasePreprocessor):
                 self.scale_factor_threshold
             )
             new_w, new_h = int(w * scale_factor), int (h * scale_factor)
-            return cv2.resize(gray, (new_h, new_w), interpolation=cv2.INTER_CUBIC)
+            return cv2.resize(gray, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
         return gray
 
     def preprocess(self, image: np.ndarray) -> List[np.ndarray]:

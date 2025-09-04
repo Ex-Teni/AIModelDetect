@@ -1,5 +1,6 @@
 from typing import List, Tuple
-import importlib.resources as pkg_resources
+from importlib import resources
+import torch
 import numpy as np
 from ultralytics import YOLO
 
@@ -10,8 +11,8 @@ from ..ocr import PlateOCR
 class PlateDetector(BaseDetector):
     """Detector cho biến số xe"""
     def _load_model(self):
-        with pkg_resources.path('lib.model', 'detect_PlateNumber.pt') as model_path:
-            self.model = YOLO(str(model_path)).to(self.device)
+        with resources.path('lib.model', 'detect_PlateNumber.pt') as model_path:
+            self.model = YOLO(str(model_path))
             self.ocr = PlateOCR()
 
     def _safe_crop(self, 
