@@ -69,7 +69,7 @@ class FaceDetector(BaseDetector):
                 image_size=160,
                 margin=20,
                 min_face_size=40,
-                thresholds=[0.6, 0.7, 0.7],
+                thresholds=[0.5, 0.6, 0.7],
                 factor=0.709,
                 post_process=True,
                 device=device,
@@ -162,15 +162,15 @@ class FaceDetector(BaseDetector):
             # Auto-detect similarity metric
             if isinstance(self.faiss_index, faiss.IndexFlatIP):
                 self.similarity_metric = "cosine"
-                self.sim_threshold = 0.5
+                self.sim_threshold = 0.6
                 print("[INFO] Using cosine similarity")
             elif isinstance(self.faiss_index, faiss.IndexFlatL2):
                 self.similarity_metric = "l2"
-                self.sim_threshold = 1.0
+                self.sim_threshold = 0.8
                 print("[INFO] Using L2 distance")
             else:
                 self.similarity_metric = "cosine"
-                self.sim_threshold = 0.5
+                self.sim_threshold = 0.6
                 print("[WARN] Unknown FAISS index type, defaulting to cosine")
             
             print(f"[SUCCESS] Face database loaded:")

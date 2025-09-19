@@ -1,5 +1,6 @@
 from typing import List, Tuple
 from importlib import resources
+import cv2
 import torch
 import numpy as np
 from ultralytics import YOLO
@@ -59,6 +60,33 @@ class PlateDetector(BaseDetector):
                     continue
 
                 cropped, _ = self._safe_crop(image, x1, y1, x2, y2, pad=8)
+
+                failed_reason = None
+
+                # -------- Check quality -----------
+                box_w, box_h = x2 - x1, y2 - y1
+                img_h, img_w = image.shape[:2]
+                box_ratio = (box_w * box_h) / (img_w * img_h)
+
+                # Too small (too far)
+                if box_ratio < 0.003: # Càng tăng càng khắt khe
+                    failed_reason = "[WARN] TOO FAR"
+
+                # Too big (too close)
+                elif box_ratio > 0.03: # Càng giảm càng khắt khe
+                    failed_reason = "[WARN] TOO CLOSE"
+
+                # Check blur
+                elif cropped is not None and cropped.size > 0:
+                    gray = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
+                    lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+                    if lap_var < 100:   # threshold tùy chỉnh
+                        failed_reason = "[WARN] TOO BLUR"
+
+                # Check skew (góc nghiêng)
+                aspect_ratio = box_w / float(box_h + 1e-6)
+                if aspect_ratio > 10 or aspect_ratio < 2.5:  # ISO code thường 2–8
+                    failed_reason = "[WARN] TOO LEAN"
                 
                 # Nếu crop ra ảnh rỗng
                 if cropped is None or cropped.size == 0:
@@ -69,7 +97,8 @@ class PlateDetector(BaseDetector):
                         text=None,
                         detection_confidence=det_conf,
                         ocr_confidence=0.0,
-                        is_multiline=False
+                        is_multiline=False,
+                        failed_reason=failed_reason,
                     )
                     candidates.append((det_conf, r))
                     continue
@@ -92,7 +121,8 @@ class PlateDetector(BaseDetector):
                     text=text,
                     detection_confidence=det_conf,
                     ocr_confidence=ocr_conf if text else 0.0,
-                    is_multiline=False
+                    is_multiline=False,
+                    failed_reason=failed_reason,
                 )
                 candidates.append((final_conf, r))
 
@@ -108,3 +138,11 @@ class PlateDetector(BaseDetector):
             return []
 
 
+'''
+* Các trường hợp gây lỗi detect, đọc dữ liệu sai:
++ Ảnh quá nhỏ
++ Ảnh quá xa
++ Ký tự bị cắt, tia sáng che chữ
++ Ảnh bị mờ
+--> Phụ thuộc vào chất lượng ảnh
+'''

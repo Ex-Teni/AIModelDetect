@@ -2,6 +2,7 @@ from typing import List, Tuple
 from importlib import resources
 import torch
 import numpy as np
+import cv2
 from ultralytics import YOLO
 
 from ..results import DetectionResult, ContainerResult
@@ -59,6 +60,33 @@ class ContainerDetector(BaseDetector):
 
                 cropped, _ = self._safe_crop(image, x1, y1, x2, y2, pad=10)
 
+                failed_reason = None
+
+                # -------- Check quality -----------
+                box_w, box_h = x2 - x1, y2 - y1
+                img_h, img_w = image.shape[:2]
+                box_ratio = (box_w * box_h) / (img_w * img_h)
+
+                # Too small (too far)
+                if box_ratio < 0.003: # Càng tăng càng khắt khe
+                    failed_reason = "[WARN] TOO FAR"
+
+                # Too big (too close)
+                elif box_ratio > 0.01: # Càng giảm càng khắt khe
+                    failed_reason = "[WARN] TOO CLOSE"
+
+                # Check blur
+                elif cropped is not None and cropped.size > 0:
+                    gray = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
+                    lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+                    if lap_var < 100:   # threshold tùy chỉnh
+                        failed_reason = "[WARN] TOO BLUR"
+
+                # Check skew (góc nghiêng)
+                aspect_ratio = box_w / float(box_h + 1e-6)
+                if aspect_ratio > 8 or aspect_ratio < 1.5:  # ISO code thường 2–8
+                    failed_reason = "[WARN] TOO LEAN"
+
                 if cropped is None or cropped.size == 0:
                     r = ContainerResult(
                         detection_type='container',
@@ -67,7 +95,7 @@ class ContainerDetector(BaseDetector):
                         text=None,
                         detection_confidence=det_conf,
                         ocr_confidence=0.0,
-                        orientation="horizontal"
+                        failed_reason=failed_reason,
                     )
                     candidates.append((det_conf, r))
                     continue
@@ -80,7 +108,7 @@ class ContainerDetector(BaseDetector):
                     ocr_conf = float(ocr_conf or 0.0)
                 except Exception as e:
                     print(f"[ERROR] Container OCR error: {e}")
-                    text, ocr_conf, orientation = None, 0.0, "horizontal"
+                    text, ocr_conf = None, 0.0
 
                 final_conf = ocr_conf if text else det_conf
                 r = ContainerResult(
@@ -90,7 +118,7 @@ class ContainerDetector(BaseDetector):
                     text=text,
                     detection_confidence=det_conf,
                     ocr_confidence=ocr_conf if text else 0.0,
-                    orientation="horizontal"
+                    failed_reason=failed_reason,
                 )
                 candidates.append((final_conf, r))
 
@@ -105,3 +133,15 @@ class ContainerDetector(BaseDetector):
             print(f"[ERROR] Container detection failed: {e}")
             return []
 
+
+
+
+'''
+* Các trường hợp gây lỗi detect, đọc dữ liệu sai:
++ Ảnh quá gần
++ Ảnh quá xa
++ Chữ bị xước
++ Ảnh bị nhoè
++ Góc chụp bị nghiêng
+--> Phụ thuộc vào khoảng cách chụp ISO container
+'''

@@ -23,39 +23,41 @@ class DetectionResult:
 
 @dataclass  
 class PlateResult(DetectionResult):
-    """Kết quả phát hiện biển số xe"""
-    detection_confidence: float = 0.0  # Confidence của YOLO detection
-    ocr_confidence: float = 0.0       # Confidence của OCR
-    is_multiline: bool = False        # Biển số 2 dòng hay không
+    """Tổng hợp kết quả phát hiện biển số xe"""
+    detection_confidence: float = 0.0  
+    ocr_confidence: float = 0.0      
+    is_multiline: bool = False        
+    failed_reason: Optional[str] = None 
     
     def to_dict(self) -> Dict[str, Any]:
         result = super().to_dict()
         result.update({
             'detection_confidence': self.detection_confidence,
             'ocr_confidence': self.ocr_confidence,
-            'is_multiline': self.is_multiline
+            'is_multiline': self.is_multiline,
+            'failed_reason': self.failed_reason or "OK"
         })
         return result
 
 @dataclass
 class ContainerResult(DetectionResult):
-    """Kết quả phát hiện container code"""
+    """Tổng hợp kết quả phát hiện container code"""
     detection_confidence: float = 0.0
     ocr_confidence: float = 0.0
-    orientation: str = "horizontal"  # horizontal/vertical
+    failed_reason: Optional[str] = None 
     
     def to_dict(self) -> Dict[str, Any]:
         result = super().to_dict()
         result.update({
             'detection_confidence': self.detection_confidence,
             'ocr_confidence': self.ocr_confidence,
-            'orientation': self.orientation
+            'failed_reason': self.failed_reason or "OK"
         })
         return result
 
 @dataclass
 class FaceResult(DetectionResult):
-    """Kết quả phát hiện khuôn mặt"""
+    """Tổng hợp kết quả phát hiện khuôn mặt"""
     detection_confidence: float = 0.0    # MTCNN confidence
     recognition_confidence: float = 0.0  # Face recognition confidence
     person_name: Optional[str] = None    # Tên người được nhận dạng

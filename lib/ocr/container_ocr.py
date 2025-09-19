@@ -1,3 +1,4 @@
+import cv2
 import numpy as np
 import easyocr
 from typing import List, Tuple, Optional
@@ -107,7 +108,7 @@ class ContainerOCR(BaseOCR):
         """Tính bonus điểm cho pattern đúng định dạng số container"""
         import re
         clean_text = text.replace(' ', '').replace('-', '').upper()
-        # Pattern: 4 chữ + 6 hoặc 7 số
-        if re.match(r'^[A-Z]{4}\d{6,7}$', clean_text):
+        # Pattern: 4 chữ + 7 số
+        if re.match(r'^[A-Z]{4}\d{7}$', clean_text):
             return 0.2
         return 0.0
