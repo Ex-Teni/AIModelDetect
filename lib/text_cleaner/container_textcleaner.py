@@ -103,7 +103,7 @@ class ContainerTextCleaner(BaseTextCleaner):
         return t, 0.0
 
 
-# # ==============CLEANER 10 CHARACTER================= #
+# # ==============CLEANER 11 CHARACTER================= #
 # import re
 # from typing import Optional, Tuple
 # from .base_textcleaner import BaseTextCleaner
@@ -130,7 +130,7 @@ class ContainerTextCleaner(BaseTextCleaner):
 #         }
 
 #         # Nếu đủ dài → tách phần chữ và số
-#         if len(text) >= 10:
+#         if len(text) >= 11:
 #             letter_part = text[:4]
 #             number_part = text[4:]
 
@@ -142,18 +142,18 @@ class ContainerTextCleaner(BaseTextCleaner):
 
 #             corrected_numbers = ''.join(
 #                 digit_fallback.get(c, c) if c.isalpha() else c
-#                 for c in number_part[:6]  # chỉ lấy 6 số
+#                 for c in number_part[:7]  # chỉ lấy 6 số
 #             )
 
 #             candidate = corrected_letters + corrected_numbers
 
 #             # Nếu match chuẩn → trả luôn
-#             if re.match(r'^[A-Z]{4}\d{6}$', candidate):
+#             if re.match(r'^[A-Z]{4}\d{7}$', candidate):
 #                 return candidate
 
 #         # Nếu không chuẩn → fallback
 #         if len(text) >= 8:
-#             return text[:10]  # chỉ giữ 10 ký tự
+#             return text[:11]  # chỉ giữ 10 ký tự
 
 #         return None
 
@@ -166,15 +166,15 @@ class ContainerTextCleaner(BaseTextCleaner):
 #         t = (text or "").replace(" ", "").replace("-", "").upper()
 
 #         # Case chuẩn: 4 chữ + 6 số (10 ký tự, bỏ check digit)
-#         if re.match(r'^[A-Z]{4}\d{6}$', t):
+#         if re.match(r'^[A-Z]{4}\d{7}$', t):
 #             return t, 0.30
 
 #         # Case OCR đọc ngược: 6 số + 4 chữ
-#         if re.match(r'^\d{6}[A-Z]{4}$', t):
+#         if re.match(r'^\d{7}[A-Z]{4}$', t):
 #             letters = t[-4:]
 #             numbers = t[:-4]
 #             fixed = letters + numbers
-#             if re.match(r'^[A-Z]{4}\d{6}$', fixed):
+#             if re.match(r'^[A-Z]{4}\d{7}$', fixed):
 #                 return fixed, 0.25
 #             return t, 0.10  # không fix được thì vẫn trả về
 
