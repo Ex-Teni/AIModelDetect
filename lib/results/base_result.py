@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Any
+from datetime import datetime
 
 @dataclass  
 class DetectionResult:
@@ -8,13 +9,17 @@ class DetectionResult:
     bbox: List[int]      # [x1, y1, x2, y2]
     confidence: float    # Độ tin cậy tổng thể
     text: Optional[str] = None  # Text nhận dạng được
+    timestamp: str = datetime.now().isoformat()[:19]
+    source: Optional[str] = None
     
     def to_dict(self) -> Dict[str, Any]:
         return {
             'type': self.detection_type,
             'text': self.text,
             'bounding_box': self.bbox,
-            'confidence': self.confidence
+            'confidence': self.confidence,
+            'timestamp': self.timestamp,
+            'source': self.source
         }
     
     def to_text_summary(self) -> str:
@@ -34,7 +39,6 @@ class PlateResult(DetectionResult):
         result.update({
             'detection_confidence': self.detection_confidence,
             'ocr_confidence': self.ocr_confidence,
-            'is_multiline': self.is_multiline,
             'failed_reason': self.failed_reason or "OK"
         })
         return result

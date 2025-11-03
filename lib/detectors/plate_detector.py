@@ -97,7 +97,6 @@ class PlateDetector(BaseDetector):
                         text=None,
                         detection_confidence=det_conf,
                         ocr_confidence=0.0,
-                        is_multiline=False,
                         failed_reason=failed_reason,
                     )
                     candidates.append((det_conf, r))
@@ -121,7 +120,6 @@ class PlateDetector(BaseDetector):
                     text=text,
                     detection_confidence=det_conf,
                     ocr_confidence=ocr_conf if text else 0.0,
-                    is_multiline=False,
                     failed_reason=failed_reason,
                 )
                 candidates.append((final_conf, r))

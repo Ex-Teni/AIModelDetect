@@ -47,9 +47,9 @@ class BatchProcessor:
         if output_format == "json":
             return self._format_json_output(results)
         elif output_format == "text":
-            return self._format_text_output(results) # type: ignore
+            return self._format_text_output(results)
         elif output_format == "csv":
-            return self._format_csv_output(results) # type: ignore
+            return self._format_csv_output(results)
         
         return results
     
