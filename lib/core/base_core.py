@@ -269,7 +269,7 @@ class MultiDetect_Core:
                 draw_mode="all",                       -kiểu hiển thị ("bbox" chỉ khung, "text" chỉ OCR, "all" cả hai) \n
                 fast_mode=True,                        -tăng tốc bằng cách bỏ frame trễ khi luồng video quá nhanh \n
                 callback=on_detect,                    -trả kết quả 
-                resize_display=(1280, 720)             - giảm độ phân giải khi hiển thị để tăng FPS \n
+                resize_display=(1280, 720)             -giảm độ phân giải khi hiển thị để tăng FPS \n
             )
 
         VD1 – chạy camera:
