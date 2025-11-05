@@ -10,6 +10,20 @@ from .base_detector import BaseDetector
 from ..ocr import PlateOCR
 
 class PlateDetector(BaseDetector):
+
+    # ------------------------------
+    # Cấu hình chỉnh sửa
+    # ------------------------------
+    CONF_THRESHOLD   = 0.4       # Ngưỡng confidence YOLO
+    IOU_THRESHOLD    = 0.5       # Ngưỡng IoU cho NMS
+    PAD_SIZE         = 8         # Padding khi crop vùng biển số
+
+    MIN_BOX_RATIO    = 0.003     # Tỉ lệ vùng bbox nhỏ nhất (so với ảnh)
+    MAX_BOX_RATIO    = 0.03      # Tỉ lệ vùng bbox lớn nhất (so với ảnh)
+    BLUR_THRESHOLD   = 100       # Ngưỡng Laplacian để kiểm tra độ mờ
+    ASPECT_RATIO_MIN = 2.5       # Giới hạn tỉ lệ width/height thấp nhất
+    ASPECT_RATIO_MAX = 10.0      # Giới hạn tỉ lệ width/height cao nhất
+    
     """Detector cho biến số xe"""
     def _load_model(self):
         with resources.path('lib.model', 'detect_PlateNumber.pt') as model_path:
@@ -40,9 +54,10 @@ class PlateDetector(BaseDetector):
         """
 
         try:
-            outs = self.model(image, conf=0.4, iou=0.5)
+            outs = self.model(image, conf=self.CONF_THRESHOLD, iou=self.IOU_THRESHOLD)
             res = outs[0] if isinstance(outs, (list, tuple)) else outs
-            if not hasattr(res, "boxes") or len(res.boxes) == 0:
+
+            if not hasattr(res, "boxes") or res.boxes is None or len(res.boxes) == 0:
                 return []
 
             boxes_xyxy = res.boxes.xyxy
@@ -50,45 +65,41 @@ class PlateDetector(BaseDetector):
             if hasattr(boxes_xyxy, "cpu"): boxes_xyxy = boxes_xyxy.cpu().numpy()
             if hasattr(boxes_conf, "cpu"): boxes_conf = boxes_conf.cpu().numpy()
 
-            candidates: list[tuple[float, PlateResult]] = []
+            candidates: List[Tuple[float, PlateResult]] = []
+            img_h, img_w = image.shape[:2]
 
             for (x1, y1, x2, y2), det_conf in zip(boxes_xyxy, boxes_conf):
                 x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
                 det_conf = float(det_conf)
-                # Bỏ qua box không hợp lệ (sau khi ép int)
                 if x2 <= x1 or y2 <= y1:
                     continue
 
-                cropped, _ = self._safe_crop(image, x1, y1, x2, y2, pad=8)
-
+                cropped, _ = self._safe_crop(image, x1, y1, x2, y2, pad=self.PAD_SIZE)
                 failed_reason = None
 
-                # -------- Check quality -----------
+                # ---------------------------
+                # Kiểm tra chất lượng vùng phát hiện
+                # ---------------------------
                 box_w, box_h = x2 - x1, y2 - y1
-                img_h, img_w = image.shape[:2]
                 box_ratio = (box_w * box_h) / (img_w * img_h)
 
-                # Too small (too far)
-                if box_ratio < 0.003: # Càng tăng càng khắt khe
+                if box_ratio < self.MIN_BOX_RATIO:
                     failed_reason = "[WARN] TOO FAR"
-
-                # Too big (too close)
-                elif box_ratio > 0.03: # Càng giảm càng khắt khe
+                elif box_ratio > self.MAX_BOX_RATIO:
                     failed_reason = "[WARN] TOO CLOSE"
-
-                # Check blur
                 elif cropped is not None and cropped.size > 0:
                     gray = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
                     lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-                    if lap_var < 100:   # threshold tùy chỉnh
+                    if lap_var < self.BLUR_THRESHOLD:
                         failed_reason = "[WARN] TOO BLUR"
 
-                # Check skew (góc nghiêng)
                 aspect_ratio = box_w / float(box_h + 1e-6)
-                if aspect_ratio > 10 or aspect_ratio < 2.5:  # ISO code thường 2–8
+                if aspect_ratio > self.ASPECT_RATIO_MAX or aspect_ratio < self.ASPECT_RATIO_MIN:
                     failed_reason = "[WARN] TOO LEAN"
-                
-                # Nếu crop ra ảnh rỗng
+
+                # ---------------------------
+                # OCR xử lý vùng biển số
+                # ---------------------------
                 if cropped is None or cropped.size == 0:
                     r = PlateResult(
                         detection_type='plate',
@@ -102,21 +113,21 @@ class PlateDetector(BaseDetector):
                     candidates.append((det_conf, r))
                     continue
 
+                text, ocr_conf = None, 0.0
                 try:
                     text, ocr_conf = self.ocr.extract_text(cropped)
-                    if text is not None and isinstance(text, str):
+                    if text:
                         text = text.strip()
-                    ocr_conf = float(ocr_conf or 0.0)
+                        ocr_conf = float(ocr_conf or 0.0)
                 except Exception as e:
                     print(f"[ERROR] Plate OCR error: {e}")
 
-                    text, ocr_conf = None, 0.0
-                
                 final_conf = ocr_conf if text else det_conf
+
                 r = PlateResult(
                     detection_type='plate',
                     bbox=[x1, y1, x2, y2],
-                    confidence=ocr_conf if text else det_conf,
+                    confidence=final_conf,
                     text=text,
                     detection_confidence=det_conf,
                     ocr_confidence=ocr_conf if text else 0.0,
@@ -126,21 +137,10 @@ class PlateDetector(BaseDetector):
 
             if not candidates:
                 return []
-            
-            # Chọn best
+
             best_conf, best_result = max(candidates, key=lambda t: t[0])
             return [best_result]
-    
+
         except Exception as e:
             print(f"[ERROR] Plate detection failed: {e}")
             return []
-
-
-'''
-* Các trường hợp gây lỗi detect, đọc dữ liệu sai:
-+ Ảnh quá nhỏ
-+ Ảnh quá xa
-+ Ký tự bị cắt, tia sáng che chữ
-+ Ảnh bị mờ
---> Phụ thuộc vào chất lượng ảnh
-'''
