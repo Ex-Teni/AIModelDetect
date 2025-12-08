@@ -160,7 +160,7 @@ class VideoProcessor:
     
     def _output_to_json(self, frame_id, detections):
         data = {
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.datetime.now().isoformat(),
             "frame_id": frame_id,
             "detections": []
         }

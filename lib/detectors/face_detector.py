@@ -248,7 +248,7 @@ class FaceDetector(BaseDetector):
             
             # Calculate embedding
             with torch.no_grad():
-                face_tensor = face_tensor.unsqueeze(0)
+                face_tensor = face_tensor.unsqueeze(0).to(next(self.resnet.parameters()).device)
                 embedding = self.resnet(face_tensor)
                 embedding = embedding.cpu().numpy().flatten()
                 embedding = embedding / np.linalg.norm(embedding)

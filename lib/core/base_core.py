@@ -9,6 +9,10 @@ from ..utils import BatchProcessor, ImageProcessor, VideoProcessor
 class MultiDetect_Core:
     """
     Lớp lõi cho hệ thống phát hiện đa đối tượng (biển số, container, khuôn mặt).
+
+    Model YOLOv8, PaddleOCR, EasyOCR, MTCNN(facenet-pytorch), Facenet: GPU
+    Model Faiss, Pkl: CPU
+    
     Hỗ trợ:
       - Phát hiện + OCR theo từng loại
       - Xử lý ảnh theo batch
