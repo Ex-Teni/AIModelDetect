@@ -1,0 +1,1 @@
+tạo, thêm, sửa, xoá, tìm kiếm, xem chi tiết, tìm kiếm(filter), in, duyệt 
